@@ -1,0 +1,14 @@
+[package]
+name = "nsh-app-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Standalone: not a member of the Rike workspace.
+[workspace]
+
+[dependencies]
+nsh-core = { git = "https://github.com/longbridge/nsh", rev = "a5036af48ddc193b5023ece9b9196c76b8f8d3f5" }
+nsh-base = { git = "https://github.com/longbridge/nsh", rev = "a5036af48ddc193b5023ece9b9196c76b8f8d3f5" }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time"] }

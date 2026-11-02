@@ -1,0 +1,6 @@
+target/
+*.swp
+.DS_Store
+.nsh/
+node_modules/
+/ui/dist/
