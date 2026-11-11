@@ -1,0 +1,15 @@
+[package]
+name = "tantivy-fts"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of the Rike workspace.
+[workspace]
+
+[dependencies]
+tantivy = "0.27"
+jieba-rs = "0.11"
+
+[profile.release]
+debug = false
