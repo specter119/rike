@@ -29,7 +29,9 @@ use rike_core::serialize::serialize_page;
 use rike_core::task::Marker;
 use rike_core::{Block, BlockId, Page};
 use rike_index::resolve_title;
-use rike_index::{BacklinkGroup, BlockInfo, Index, MemIndex, PageEntry, PageSource, SearchHit};
+use rike_index::{
+    BacklinkGroup, BlockInfo, Index, IndexChanges, MemIndex, PageEntry, PageSource, SearchHit,
+};
 use rike_vault::{SaveOutcome, Vault, VaultError, VaultEvent, VaultHandle};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -60,8 +62,10 @@ pub enum Event {
     },
     /// A toast or a page-level conflict banner.
     Notice(Notice),
-    /// The index changed; re-fetch visible pages and rebuild rows whose `rev` changed.
-    IndexVer(u64),
+    /// The index changed. `changes` says which pages moved and which backlink
+    /// groups went stale, so consumers can dirty-check; `ver` is a monotonic
+    /// "anything changed" counter for consumers that re-derive everything.
+    IndexVer { ver: u64, changes: IndexChanges },
     /// The page list changed (a file appeared or disappeared).
     Pages,
 }
@@ -523,7 +527,7 @@ struct Inner {
     /// Once `leave` starts the pump stops scheduling new saves.
     leaving: bool,
     index_ver: u64,
-    index_dirty: bool,
+    index_changes: IndexChanges,
     sink: Option<EventSink>,
     /// Events coalesced while no sink is registered; replayed on registration.
     backlog: Vec<Event>,
@@ -564,7 +568,7 @@ impl Session {
                 quitting: false,
                 leaving: false,
                 index_ver: 0,
-                index_dirty: false,
+                index_changes: IndexChanges::default(),
                 sink: None,
                 backlog: Vec::new(),
                 pump_tx,
@@ -740,20 +744,17 @@ impl Session {
         let _ = self.inner.borrow().pump_tx.send(msg);
     }
 
-    fn mark_index_dirty(&self) {
-        self.inner.borrow_mut().index_dirty = true;
-        self.send(PumpMsg::IndexDirty);
-    }
-
     fn emit_index_ver(&self) {
         let event = {
             let mut i = self.inner.borrow_mut();
-            if !i.index_dirty {
+            if i.index_changes.is_empty() {
                 return;
             }
-            i.index_dirty = false;
             i.index_ver += 1;
-            Event::IndexVer(i.index_ver)
+            Event::IndexVer {
+                ver: i.index_ver,
+                changes: std::mem::take(&mut i.index_changes),
+            }
         };
         self.emit(event);
     }
@@ -834,7 +835,6 @@ impl Session {
                     notice
                 };
                 let _ = vault.set_read_only(rel, read_only).await;
-                self.mark_index_dirty();
                 if let Some(message) = notice {
                     self.notify(rel, message, NoticeKind::Info);
                 }
@@ -970,7 +970,6 @@ impl Session {
                     index_page(&mut i, rel);
                 }
                 self.send(PumpMsg::SaveDebounced(rel.to_owned()));
-                self.mark_index_dirty();
                 true
             }
         }
@@ -1282,9 +1281,6 @@ impl Session {
             Save::Debounced => self.send(PumpMsg::SaveDebounced(rel.to_owned())),
             Save::No => {}
         }
-        if !matches!(save, Save::No) {
-            self.mark_index_dirty();
-        }
         let page = self
             .page_view(rel)
             .ok_or_else(|| SessionError::NotLoaded(rel.to_owned()))?;
@@ -1347,7 +1343,6 @@ impl Session {
             index_page(&mut i, rel);
         }
         self.send(PumpMsg::SaveDebounced(rel.to_owned()));
-        self.mark_index_dirty();
         let page = self
             .page_view(rel)
             .ok_or_else(|| SessionError::NotLoaded(rel.to_owned()))?;
@@ -1427,7 +1422,6 @@ impl Session {
             let mut i = self.inner.borrow_mut();
             index_page(&mut i, rel);
         }
-        self.mark_index_dirty();
         match self.vault().save(rel, content.clone()).await {
             Ok(SaveOutcome::Saved { .. }) => {
                 let mut i = self.inner.borrow_mut();
@@ -1713,7 +1707,9 @@ impl Session {
             VaultEvent::Removed { rel } => {
                 let loaded = {
                     let mut i = self.inner.borrow_mut();
-                    i.index.remove_page(&rel);
+                    let delta = i.index.remove_page(&rel);
+                    i.index_changes.record_remove(&rel, delta);
+                    let _ = i.pump_tx.send(PumpMsg::IndexDirty);
                     match i.docs.get_mut(&rel) {
                         Some(ps) => {
                             ps.doc.exists = false;
@@ -1722,7 +1718,6 @@ impl Session {
                         None => false,
                     }
                 };
-                self.mark_index_dirty();
                 self.emit(Event::Pages);
                 if loaded {
                     self.notify(&rel, format!("{rel} 已在磁盘上被删除"), NoticeKind::Info);
@@ -1759,7 +1754,6 @@ impl Session {
                 let parsed = parse_page(content);
                 index_parsed(&mut i, rel, &parsed.page);
                 drop(i);
-                self.mark_index_dirty();
                 Vec::new()
             }
             Some(true) => {
@@ -1820,7 +1814,6 @@ impl Session {
             };
             (read_only, r#gen)
         };
-        self.mark_index_dirty();
         self.emit(Event::PageChanged {
             rel: rel.to_owned(),
             r#gen,
@@ -1843,7 +1836,6 @@ impl Session {
                 self.index_from_disk(&file.rel, false).await;
             }
         }
-        self.mark_index_dirty();
         self.emit(Event::Pages);
     }
 
@@ -1854,7 +1846,6 @@ impl Session {
                 let parsed = parse_page(&loaded.content);
                 index_parsed(&mut i, rel, &parsed.page);
             }
-            self.mark_index_dirty();
             if announce {
                 self.emit(Event::Pages);
             }
@@ -2084,7 +2075,23 @@ pub(crate) fn coalesce(backlog: &mut Vec<Event>, event: Event) {
         Event::PageChanged { rel, .. } => {
             backlog.retain(|e| !matches!(e, Event::PageChanged { rel: r, .. } if r == rel));
         }
-        Event::IndexVer(_) => backlog.retain(|e| !matches!(e, Event::IndexVer(_))),
+        Event::IndexVer { ver, changes } => {
+            let merged = backlog.iter_mut().find_map(|e| match e {
+                Event::IndexVer {
+                    ver: old_ver,
+                    changes: old,
+                } => {
+                    old.merge(changes.clone());
+                    *old_ver = (*old_ver).max(*ver);
+                    Some(())
+                }
+                _ => None,
+            });
+            if merged.is_none() {
+                backlog.push(event.clone());
+            }
+            return;
+        }
         Event::Pages => backlog.retain(|e| !matches!(e, Event::Pages)),
         Event::Notice(_) => {}
     }
@@ -2095,19 +2102,23 @@ fn index_page(i: &mut Inner, rel: &str) {
     let Some(ps) = i.docs.get(rel) else {
         return;
     };
-    i.index.upsert_page(PageSource {
+    let delta = i.index.upsert_page(PageSource {
         rel_path: rel,
         page: &ps.doc.page,
         config: &i.config,
     });
+    i.index_changes.record_upsert(rel, delta);
+    let _ = i.pump_tx.send(PumpMsg::IndexDirty);
 }
 
 fn index_parsed(i: &mut Inner, rel: &str, page: &Page) {
-    i.index.upsert_page(PageSource {
+    let delta = i.index.upsert_page(PageSource {
         rel_path: rel,
         page,
         config: &i.config,
     });
+    i.index_changes.record_upsert(rel, delta);
+    let _ = i.pump_tx.send(PumpMsg::IndexDirty);
 }
 
 fn push_undo(i: &mut Inner, rel: &str, before: Page) {
@@ -2207,8 +2218,15 @@ mod tests {
     #[test]
     fn backlog_coalesces_by_kind() {
         let mut backlog = Vec::new();
-        coalesce(&mut backlog, Event::IndexVer(1));
-        coalesce(&mut backlog, Event::IndexVer(2));
+        let ver = |ver, changed: &[&str]| Event::IndexVer {
+            ver,
+            changes: IndexChanges {
+                changed: changed.iter().map(|rel| rel.to_string()).collect(),
+                ..IndexChanges::default()
+            },
+        };
+        coalesce(&mut backlog, ver(1, &["pages/a.md"]));
+        coalesce(&mut backlog, ver(2, &["pages/b.md"]));
         coalesce(
             &mut backlog,
             Event::PageChanged {
@@ -2228,7 +2246,8 @@ mod tests {
         assert_eq!(
             backlog,
             vec![
-                Event::IndexVer(2),
+                // The two index events merge: newest ver, union of changes.
+                ver(2, &["pages/a.md", "pages/b.md"]),
                 Event::PageChanged {
                     rel: "pages/a.md".into(),
                     r#gen: 3

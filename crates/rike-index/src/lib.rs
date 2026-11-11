@@ -6,6 +6,8 @@
 mod mem;
 mod title;
 
+use std::collections::BTreeSet;
+
 use rike_core::BlockId;
 use rike_core::config::VaultConfig;
 use rike_core::journal::JournalDate;
@@ -13,6 +15,60 @@ use rike_core::names::PageKey;
 
 pub use mem::MemIndex;
 pub use title::resolve_title;
+
+/// What one index mutation invalidated. Backends report this so the session
+/// can tell the UI precisely which derived data went stale, instead of
+/// dropping a global version number and re-deriving everything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PageDelta {
+    /// Page keys whose backlink groups changed: every key the page
+    /// referenced before or after the mutation. The page's own old and new
+    /// key are included only when the key itself changed — a page never
+    /// appears in its own backlink group, but a rename moves the query.
+    pub backlink_keys: BTreeSet<PageKey>,
+}
+
+/// Index mutations accumulated between two `IndexVer` events.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndexChanges {
+    /// Pages upserted since the last flush.
+    pub changed: BTreeSet<String>,
+    /// Pages removed since the last flush.
+    pub removed: BTreeSet<String>,
+    /// Page keys whose backlink groups changed since the last flush.
+    pub backlink_keys: BTreeSet<PageKey>,
+}
+
+impl IndexChanges {
+    pub fn record_upsert(&mut self, rel: &str, delta: PageDelta) {
+        self.changed.insert(rel.to_owned());
+        self.removed.remove(rel);
+        self.backlink_keys.extend(delta.backlink_keys);
+    }
+
+    pub fn record_remove(&mut self, rel: &str, delta: PageDelta) {
+        self.removed.insert(rel.to_owned());
+        self.changed.remove(rel);
+        self.backlink_keys.extend(delta.backlink_keys);
+    }
+
+    /// Folds a later flush's changes into this one; used when coalescing.
+    pub fn merge(&mut self, later: IndexChanges) {
+        for rel in &later.removed {
+            self.changed.remove(rel);
+        }
+        for rel in &later.changed {
+            self.removed.remove(rel);
+        }
+        self.changed.extend(later.changed);
+        self.removed.extend(later.removed);
+        self.backlink_keys.extend(later.backlink_keys);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.removed.is_empty() && self.backlink_keys.is_empty()
+    }
+}
 
 /// One indexed page file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,9 +140,11 @@ pub enum IndexWarning {
 }
 
 pub trait Index {
-    /// Inserts or replaces everything known about `source.rel_path`.
-    fn upsert_page(&mut self, source: PageSource<'_>);
-    fn remove_page(&mut self, rel_path: &str);
+    /// Inserts or replaces everything known about `source.rel_path` and
+    /// reports what the change invalidated.
+    fn upsert_page(&mut self, source: PageSource<'_>) -> PageDelta;
+    /// Removes `rel_path` and reports what the removal invalidated.
+    fn remove_page(&mut self, rel_path: &str) -> PageDelta;
 
     /// All pages sorted by title (case-insensitive).
     fn pages(&self) -> Vec<PageEntry>;

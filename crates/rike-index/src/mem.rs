@@ -5,8 +5,8 @@ use rike_core::inline::{InlineKind, tokenize};
 use rike_core::names::PageKey;
 
 use crate::{
-    BacklinkGroup, BacklinkItem, BlockHit, BlockInfo, Index, IndexWarning, PageEntry, PageSource,
-    SearchHit, resolve_title,
+    BacklinkGroup, BacklinkItem, BlockHit, BlockInfo, Index, IndexWarning, PageDelta, PageEntry,
+    PageSource, SearchHit, resolve_title,
 };
 
 struct BlockRecord {
@@ -100,8 +100,12 @@ fn scan_text(keys: &mut BTreeSet<PageKey>, text: &str) {
 }
 
 impl Index for MemIndex {
-    fn upsert_page(&mut self, source: PageSource<'_>) {
-        self.remove_page(source.rel_path);
+    fn upsert_page(&mut self, source: PageSource<'_>) -> PageDelta {
+        let old_key = self
+            .pages
+            .get(source.rel_path)
+            .map(|old| old.entry.key.clone());
+        let mut delta = self.remove_page(source.rel_path);
 
         let (title, journal) = resolve_title(source.rel_path, source.page, source.config);
         let key = PageKey::new(&title);
@@ -133,6 +137,16 @@ impl Index for MemIndex {
             stack.push(first_line(&block.text));
         }
 
+        delta
+            .backlink_keys
+            .extend(refs.iter().map(|(key, _)| key.clone()));
+        if let Some(old) = old_key
+            && old != key
+        {
+            delta.backlink_keys.insert(old);
+            delta.backlink_keys.insert(key.clone());
+        }
+
         self.by_key
             .entry(key.clone())
             .or_default()
@@ -151,11 +165,12 @@ impl Index for MemIndex {
                 refs,
             },
         );
+        delta
     }
 
-    fn remove_page(&mut self, rel_path: &str) {
+    fn remove_page(&mut self, rel_path: &str) -> PageDelta {
         let Some(old) = self.pages.remove(rel_path) else {
-            return;
+            return PageDelta::default();
         };
         if let Some(paths) = self.by_key.get_mut(&old.entry.key) {
             paths.remove(rel_path);
@@ -178,6 +193,9 @@ impl Index for MemIndex {
                     self.block_ids.remove(&block.id);
                 }
             }
+        }
+        PageDelta {
+            backlink_keys: old.refs.iter().map(|(key, _)| key.clone()).collect(),
         }
     }
 
@@ -347,18 +365,76 @@ mod tests {
     use rike_core::parse::parse_page;
 
     use super::*;
+    use crate::IndexChanges;
 
-    fn put(index: &mut MemIndex, rel: &str, src: &str) {
+    fn put(index: &mut MemIndex, rel: &str, src: &str) -> PageDelta {
         let page = parse_page(src).page;
         index.upsert_page(PageSource {
             rel_path: rel,
             page: &page,
             config: &VaultConfig::default(),
-        });
+        })
     }
 
     fn key(name: &str) -> PageKey {
         PageKey::new(name)
+    }
+
+    #[test]
+    fn upsert_delta_reports_referenced_and_renamed_keys() {
+        let mut index = MemIndex::new();
+        let delta = put(&mut index, "pages/a.md", "- ref [[b]]");
+        assert_eq!(delta.backlink_keys, BTreeSet::from([key("b")]));
+
+        // Re-upserting the same refs reports them again: consumers that
+        // missed the previous flush still see the group as dirty.
+        let delta = put(&mut index, "pages/a.md", "- ref [[b]] and #c");
+        assert_eq!(delta.backlink_keys, BTreeSet::from([key("b"), key("c")]));
+
+        // Renaming adds the moved key — old and new — to the delta.
+        put(&mut index, "pages/b.md", "title:: B\n- a");
+        let delta = put(&mut index, "pages/b.md", "title:: C\n- a");
+        assert!(delta.backlink_keys.contains(&key("b")));
+        assert!(delta.backlink_keys.contains(&key("c")));
+
+        // A page without references and without a rename dirties nothing.
+        let delta = put(&mut index, "pages/d.md", "- plain text");
+        assert!(delta.backlink_keys.is_empty());
+    }
+
+    #[test]
+    fn remove_delta_reports_the_old_references() {
+        let mut index = MemIndex::new();
+        put(&mut index, "pages/a.md", "- ref [[b]]");
+        let delta = index.remove_page("pages/a.md");
+        assert_eq!(delta.backlink_keys, BTreeSet::from([key("b")]));
+
+        // Removing an unknown page reports nothing.
+        assert!(
+            index
+                .remove_page("pages/missing.md")
+                .backlink_keys
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn index_changes_supersede_within_a_window() {
+        let mut changes = IndexChanges::default();
+        changes.record_upsert("pages/a.md", PageDelta::default());
+        changes.record_remove("pages/a.md", PageDelta::default());
+        assert!(changes.changed.is_empty());
+        assert_eq!(changes.removed, BTreeSet::from(["pages/a.md".to_owned()]));
+
+        changes.record_upsert("pages/a.md", PageDelta::default());
+        assert_eq!(changes.changed, BTreeSet::from(["pages/a.md".to_owned()]));
+        assert!(changes.removed.is_empty());
+
+        let mut later = IndexChanges::default();
+        later.record_remove("pages/a.md", PageDelta::default());
+        changes.merge(later);
+        assert!(changes.changed.is_empty());
+        assert_eq!(changes.removed, BTreeSet::from(["pages/a.md".to_owned()]));
     }
 
     #[test]

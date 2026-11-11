@@ -4,6 +4,7 @@
 //! The session is `!Send` (engine-thread design), so every test drives it
 //! inside `LocalSet::run_until` on a current-thread runtime.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use rike_core::BlockId;
 use rike_core::journal::JournalDate;
+use rike_core::names::PageKey;
 use rike_native::session::{
     self, Boot, Event, EventSink, Hooks, LeaveVerb, NoticeKind, Session, SessionError, View,
 };
@@ -418,6 +420,48 @@ fn leave_saves_the_draft_and_relaunch_failure_stays() {
 
 // ---- events and index -----------------------------------------------------
 
+/// The index-change events carry what actually moved, so consumers can
+/// dirty-check instead of re-deriving everything on every keystroke.
+#[test]
+fn index_ver_carries_the_change_set() {
+    run(async {
+        let f = start(seed_basic, FAST, Hooks::default()).await;
+        let s = &f.session;
+        let rel = today_rel();
+
+        // First wait out the scan's event, so the edits below get windows
+        // of their own.
+        until_event(&f.events, "the scan's IndexVer", |e| {
+            matches!(e, Event::IndexVer { ver: 1, .. })
+        })
+        .await;
+
+        // A plain-text edit dirties only the page itself: no backlink keys.
+        let view = s.page(&rel).await.unwrap();
+        let id = view.rows[0].id;
+        s.set_editing(&rel, view.r#gen, id).unwrap();
+        assert!(s.set_draft(&rel, view.r#gen, id, "plain text"));
+        until_event(&f.events, "IndexVer without backlink keys", |e| {
+            matches!(e, Event::IndexVer { ver, changes }
+                if *ver == 2
+                    && changes.changed == BTreeSet::from([rel.clone()])
+                    && changes.backlink_keys.is_empty())
+        })
+        .await;
+
+        // An edit that adds a link dirties the target's backlink group.
+        assert!(s.set_draft(&rel, view.r#gen, id, "see [[Inbox]]"));
+        until_event(&f.events, "IndexVer with the target's key", |e| {
+            matches!(e, Event::IndexVer { ver, changes }
+                if *ver == 3
+                    && changes.changed == BTreeSet::from([rel.clone()])
+                    && changes.backlink_keys.contains(&PageKey::new("Inbox")))
+        })
+        .await;
+        f.pump.abort();
+    });
+}
+
 #[test]
 fn edits_emit_index_ver_and_save_after_the_debounce() {
     run(async {
@@ -432,7 +476,7 @@ fn edits_emit_index_ver_and_save_after_the_debounce() {
         until_event(
             &f.events,
             "IndexVer",
-            |e| matches!(e, Event::IndexVer(v) if *v >= 1),
+            |e| matches!(e, Event::IndexVer { ver, .. } if *ver >= 1),
         )
         .await;
         let path = f.file(&rel);

@@ -52,7 +52,10 @@ const journalsS = signal<{
 let journalCount = JOURNAL_CHUNK;
 
 const sidebarPagesS = signal<PageEntryDto[]>([]);
+/** Bumps on every index change; for consumers that re-derive everything. */
 const indexVerS = signal(0);
+/** Page keys whose backlink groups changed in the last index event. */
+const indexBacklinkKeysS = signal<readonly string[]>([]);
 const toastsS = signal<NoticeDto[]>([]);
 let localToastId = 0;
 
@@ -135,7 +138,10 @@ export function pageOf(rel: string): () => PageViewDto | undefined {
 
 export function backlinksOf(rel: string): () => BacklinkGroupDto[] {
 	return computed(() => {
-		indexVerS();
+		// The event's keys say which pages' references moved. A page's own
+		// edits never change its own backlink group, so typing in the open
+		// page no longer recomputes the panel.
+		indexBacklinkKeysS();
 		try {
 			return Rike.backlinks(rel);
 		} catch {
@@ -236,9 +242,14 @@ function onEvent(ev: EventDto): void {
 			}
 			break;
 		}
-		case "index":
+		case "index": {
 			if (ev.ver != null) indexVerS.set(ev.ver);
+			// Only move the dirty-check signals when something actually moved:
+			// setting an empty array would still wake every subscriber.
+			const keys = ev.backlinkKeys ?? [];
+			if (keys.length) indexBacklinkKeysS.set(keys);
 			break;
+		}
 		case "pages":
 			refreshPages();
 			void loadJournals();

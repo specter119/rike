@@ -233,6 +233,12 @@ pub struct EventDto {
     pub generation: Option<u64>,
     pub ver: Option<u64>,
     pub notice: Option<NoticeDto>,
+    /// `kind == "index"`: pages upserted since the previous index event.
+    pub changed: Vec<String>,
+    /// `kind == "index"`: pages removed since the previous index event.
+    pub removed: Vec<String>,
+    /// `kind == "index"`: page keys whose backlink groups changed.
+    pub backlink_keys: Vec<String>,
 }
 
 // ---- conversions -----------------------------------------------------------
@@ -435,6 +441,9 @@ fn event_dto(event: &Event) -> EventDto {
         generation: None,
         ver: None,
         notice: None,
+        changed: Vec::new(),
+        removed: Vec::new(),
+        backlink_keys: Vec::new(),
     };
     match event {
         Event::PageChanged { rel, r#gen } => EventDto {
@@ -448,9 +457,16 @@ fn event_dto(event: &Event) -> EventDto {
             notice: Some(notice_dto(notice.clone())),
             ..empty
         },
-        Event::IndexVer(ver) => EventDto {
+        Event::IndexVer { ver, changes } => EventDto {
             kind: "index".into(),
             ver: Some(*ver),
+            changed: changes.changed.iter().cloned().collect(),
+            removed: changes.removed.iter().cloned().collect(),
+            backlink_keys: changes
+                .backlink_keys
+                .iter()
+                .map(|key| key.as_str().to_owned())
+                .collect(),
             ..empty
         },
         Event::Pages => EventDto {
