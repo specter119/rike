@@ -570,7 +570,7 @@ async function leave(verb: "quit" | "switch", path?: string): Promise<void> {
 export function quit(): Promise<void> {
 	if (modeS() !== "vault") {
 		// Nothing is open, so there is nothing to save.
-		Window.close();
+		Window.get("main")?.close();
 		return Promise.resolve();
 	}
 	return leave("quit");

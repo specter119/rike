@@ -9,6 +9,6 @@ license = "MIT OR Apache-2.0"
 [workspace]
 
 [dependencies]
-nsh-core = { git = "https://github.com/longbridge/nsh", rev = "a5036af48ddc193b5023ece9b9196c76b8f8d3f5" }
-nsh-base = { git = "https://github.com/longbridge/nsh", rev = "a5036af48ddc193b5023ece9b9196c76b8f8d3f5" }
+nsh-core = { git = "https://github.com/longbridge/nsh" }
+nsh-base = { git = "https://github.com/longbridge/nsh" }
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time"] }

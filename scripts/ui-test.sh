@@ -3,7 +3,10 @@
 # Usage: scripts/ui-test.sh [nsh test args...]
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-export PATH="$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
+# nsh builds its generated crates with $CARGO; the fork cargo's shared-target
+# cache can reuse stale nsh artifacts across nsh revs, so use the stock one.
+export CARGO="${CARGO:-$HOME/.local/share/rustup-cargo/bin/cargo}"
 export TMPDIR="${TMPDIR:-$HOME/.cache/sx-tmp}" CARGO_NET_OFFLINE=true
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/rike-ui-target}"
 mkdir -p "$TMPDIR"

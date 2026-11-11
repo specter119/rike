@@ -494,7 +494,7 @@ fn hooks() -> Result<Hooks, String> {
     let boot = session::boot_or_dev().ok_or("the app was started without boot data")?;
     Ok(Hooks::new(
         boot.relaunch.clone(),
-        Arc::new(nsh_core::element::desktop::close_window),
+        Arc::new(|| nsh_core::element::desktop::main_window().close()),
     ))
 }
 

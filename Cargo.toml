@@ -48,9 +48,9 @@ typst-assets = { version = "=0.15.1", features = ["fonts"] }
 typst-layout = "=0.15.1"
 typst-render = "=0.15.1"
 
-nsh-core = { git = "https://github.com/longbridge/nsh", rev = "a5036af48ddc193b5023ece9b9196c76b8f8d3f5" }
-nsh-base = { git = "https://github.com/longbridge/nsh", rev = "a5036af48ddc193b5023ece9b9196c76b8f8d3f5", default-features = false, features = ["highlight"] }
-nsh-platform-linux = { git = "https://github.com/longbridge/nsh", rev = "a5036af48ddc193b5023ece9b9196c76b8f8d3f5", default-features = false }
+nsh-core = { git = "https://github.com/longbridge/nsh" }
+nsh-base = { git = "https://github.com/longbridge/nsh", default-features = false, features = ["highlight"] }
+nsh-platform-linux = { git = "https://github.com/longbridge/nsh", default-features = false }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
