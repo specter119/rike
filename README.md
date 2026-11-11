@@ -30,6 +30,7 @@ Rike 保留 Logseq 最受欢迎的几件事：
 - 后退 / 前进：侧栏的 ← → 按钮、`Alt+←` / `Alt+→`、鼠标侧键（后退）。
 - 点击块编辑 Markdown 源码，离开后渲染。
 - 双向链接和页面底部的反向引用面板。
+- **自动补全**：块编辑器里输入 `[[`（页面）或 `((`（块引用，需再打几个字过滤）会弹出候选，↑↓ 选择、Enter/Tab 接受、Esc 关闭；候选来自索引，页面按标题前缀优先。
 - 侧栏（Journals、所有页面）和 `Ctrl+K` 搜索。
 - 外部修改（例如同步工具、其他编辑器）会实时刷新；如果你正好有未保存的编辑，则在页面顶部提示，由你选择。
 - **数学公式**：`$x^2$`、`\(x^2\)` 是行内公式，`$$…$$`、`\[ … \]` 是独立成行的展示公式（`\[` 要在块的行首，`\]` 在行尾）。渲染走 Typst（先把 LaTeX 转成 Typst 数学再排版），颜色跟随深浅主题。点公式会进入这个块的源码编辑。转换不了的公式显示原来的 TeX 源码，不会丢内容。
@@ -54,7 +55,7 @@ Rike 保留 Logseq 最受欢迎的几件事：
 
 ### 暂不支持
 
-`[[` 自动补全、复制块引用、远端同步、`{{query}}` 查询、属性类型、未链接引用、页面重命名、图谱视图、白板、插件、多窗口、图片附件。路线图见下文。
+`[[` 补全已支持（页面和块引用）；复制块引用、远端同步、`{{query}}` 查询、属性类型、未链接引用、页面重命名、图谱视图、白板、插件、多窗口、图片附件。路线图见下文。
 
 ## 安装与运行
 
@@ -65,7 +66,7 @@ Rike 保留 Logseq 最受欢迎的几件事：
 ```sh
 # Arch Linux
 sudo pacman -S gtk4 clang
-cargo install --locked --git https://github.com/longbridge/nsh --rev a5036af48ddc193b5023ece9b9196c76b8f8d3f5 nsh-cli
+cargo install --locked --git https://github.com/longbridge/nsh nsh-cli
 
 scripts/build-release.sh          # 先编译 TSX 界面并嵌入，再编译 rike
 target/release/rike               # 自动打开上次的库，没有就显示欢迎页
@@ -129,7 +130,7 @@ tags:: 项目, 笔记
 ## 路线图
 
 - **M1**：大纲、每日页面、双向链接、搜索、本地文件监听、选库与切库。
-- **M2**：[HawDB](https://github.com/nowledge-co/hawdb) 索引后端（中文全文检索、图查询）、属性类型与页面模板、未链接引用、页面重命名、简单查询。界面是 TSX，为以后的插件系统留了路。
+- **M2**：中文全文检索（tantivy + jieba 先行，turso/hawdb 基准对比）、属性类型与页面模板、未链接引用、页面重命名、简单查询、vim 模态编辑（normal/insert 两模式，仅 vim 设置开启时）。界面是 TSX，为以后的插件系统留了路。
 - **M3**：通过 [OpenDAL](https://github.com/apache/opendal) 同步到 WebDAV 或 S3，所见即所得编辑器评估。
 
 ## 许可证

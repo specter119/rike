@@ -8,8 +8,8 @@ Rike 是兼容 Logseq 文件格式的桌面大纲笔记原型：Rust 管数据�
 
 ## 工具链与命令
 
-- Rust 1.97 或更新（edition 2024）。本机没有 rustup，所以不提供 `rust-toolchain.toml`。
-- Linux 依赖：`gtk4`（4.14 或更新）、`clang`、`nsh` 命令行（`cargo install --locked --git https://github.com/longbridge/nsh --rev a5036af48ddc193b5023ece9b9196c76b8f8d3f5 nsh-cli`，0.3.0）。不需要 WebKitGTK。
+- Rust 1.97 或更新（edition 2024）。cargo 是 huacnlee/cargo（`~/.local/share/cargo/bin`），rustc 来自 rustup（`RUSTUP_HOME=~/.local/share/rustup`，代理在 `~/.local/share/rustup-cargo/bin`，PATH 顺序不能让 rustup 的 cargo 挡住 fork cargo）。没有 `rust-toolchain.toml`。
+- Linux 依赖：`gtk4`（4.14 或更新）、`clang`、`nsh` 命令行（`cargo install --locked --git https://github.com/longbridge/nsh nsh-cli`，装最新 main）。不需要 WebKitGTK。
 - 命令（cargo 命令前设 `TMPDIR=$HOME/.cache/sx-tmp`）：
   - 检查：`cargo check --workspace`
   - 格式：`cargo fmt --all --check`
@@ -22,6 +22,7 @@ Rike 是兼容 Logseq 文件格式的桌面大纲笔记原型：Rust 管数据�
   - 运行：`target/release/rike [DIR | --vault DIR]`
 - 交付前 fmt、clippy、cargo test、`nsh check`、`scripts/ui-test.sh` 都要通过。
 - `Cargo.lock` 纳入版本控制。所有依赖版本放在根 `Cargo.toml` 的 `[workspace.dependencies]`，子 crate 用 `workspace = true`。
+- `nsh` 内部构建生成的 crate 时会用 `$CARGO`：fork cargo 的共享目标缓存可能复用旧产物（`describe` 二进制过期、rmeta 混版本），所以 `scripts/dev.sh`、`scripts/ui-test.sh`、`scripts/build-release.sh` 都把 `CARGO` 指向 rustup 的标准 cargo；直接跑 `nsh check` 时也要设。升级 nsh（`cargo update -p nsh-core` 或重装 CLI）后如报 “described by nsh x and this nsh is y”，删 `ui/.nsh/` 和 `~/.cache/rike-ui-target` 再试。
 - `nsh dev --server-only` 监听 `0.0.0.0` 且无绑定选项；`rike` 因此只接受 loopback 的 `--dev-server`（`cli::is_loopback_ws`）。别在不可信网络里开着它。
 - `rike-app` 的 `nsh-platform-linux` 必须开 `js` feature，否则日志里只有 “this build of nsh runs Rust apps only”，窗口是空白的。
 
@@ -30,7 +31,7 @@ Rike 是兼容 Logseq 文件格式的桌面大纲笔记原型：Rust 管数据�
 ```
 crates/rike-core    模型、解析、序列化、行内 tokenizer、任务标记（task.rs）。纯函数，无 IO。
 crates/rike-vault   vault actor：OpenDAL fs、watcher、写前检查、备份、冲突。
-crates/rike-index   Index trait + MemIndex（M2 加 HawDB 后端）。
+crates/rike-index   Index trait + MemIndex（M2 路线：tantivy+中文检索 → turso/hawdb 基准对比，见路线图）。
 crates/rike-native  给 TSX 用的原生模块 `Rike`：Session（页面状态、gen、编辑、保存、撤销、退出/切库）、api（DTO 和函数）、state（最近的库）、startup（启动决策）、md、math、doc。
 crates/rike-app     宿主二进制 rike：命令行、日志、tokio runtime、启动决策、窗口、嵌入 TSX bundle。
 ui/                 TSX 界面（NSH）。`nsh.json` 的 "rust" 指向 crates/rike-native。
@@ -46,7 +47,22 @@ docs/spikes/           探针与实验结论（tsx.md 是迁移到 TSX 的结论
 
 ## 界面与原生模块（`ui/`、`crates/rike-native`）
 
-分工：**Rust 管数据和保存，TSX 管界面状态**。TSX 不碰文件，只通过 `import { Rike } from "rike"` 调原生模块。
+分工：**Rust 管数据和保存，TSX 管界面状态**。判定准则：凡是“丢了会丢数据或写坏文件”的状态只归 Rust；TSX 需要的数据副本只能通过事件失效 + 重取获得，永不双向写——TSX 侧的任何副本都必须能被一条事件整体作废。编辑中的文本例外：正在编辑时，挂载的 `Input` 是最新文本的权威（`registerEditorText`），`flushDraft` 总是优先读它，`noteDraft` 只做定时器的回退值。Rust 的 `leave` 是退出/切库的唯一权威（并发 leave 会拒绝，拒绝时 Rust 和 TSX 各自复位 `quitting`）。
+
+状态归属：
+
+| 状态 | 归属 | 同步机制 |
+| --- | --- | --- |
+| 页面文档、gen、撤销/重做栈、保存节奏 | Rust `session.rs` | 同步调用 + gen 校验，结构操作返回整页 |
+| 编辑登记（busy） | Rust `Edit` | `setEditing`/`clearEditing`；TSX 只在 Rust 调用成功后更新自己的 `editing` |
+| 编辑器当前文本 | 挂载的 `Input`（TSX） | `flushDraft` → `setDraft`；`Input` 卸载后回退到 `noteDraft` 捕获值 |
+| 页面缓存（`pageMap`） | TSX | `page`/`PageChanged` 事件失效 + 重取 |
+| 视图/历史栈、本地 toast（负 id）、`quitting` 的 UI 投影 | TSX `store.ts` | `navigate`；退出结果跟随 `Rike.leave` 返回值 |
+| 通知（正 id） | Rust `notices` | `notify` 事件推送 |
+| 事件积压合并 | `session.rs::coalesce`（唯一实现） | Session backlog 和 api `BACKLOG` 两层共用同一函数 |
+| 最近库/状态文件、启动决策 | Rust `state.rs`/`startup.rs` | 原子写 |
+
+术语：`gen`（文档）、`generation`（DTO 字段）、`r#gen`（Rust 关键字转义）指同一个东西；TSX 的 `epoch` 是编辑器重建的局部序号，与 gen 无关。
 
 ```
 ui/App.tsx        根：installShortcuts()、init()、加载中/欢迎页/库
@@ -63,14 +79,15 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
 
 - **运行时归属**：vault actor、watcher、状态文件 IO 都跑在宿主 `main` 创建的 tokio runtime 上（`Boot.handle`）。`pump()` 和 `try_leave` 在引擎线程上跑，进入 runtime 要用 `session::in_runtime(handle, future)`（每次 poll 进入），**不要**把 `handle.enter()` 的 guard 跨 `.await` 持有：多个任务交错时 guard 乱序销毁会 panic（tokio ≥ 1.54）。
 - **Boot 是进程全局**（`session::set_boot` / `boot()`，克隆不取走）。`nsh dev`/`nsh test` 没有 Rust 宿主，`boot_or_dev()` 会用 `RIKE_DEV_VAULT` 在自己的 runtime 上开库；`RIKE_DEV_TODAY=yyyy-mm-dd` 固定“今天”。
-- **gen（generation）**：每页一个，只在“磁盘内容替换了内存文档”（外部变更重载、载入磁盘版本、冲突后重载）时递增。草稿和操作都带 gen，旧 gen 一律拒绝。TSX 的编辑器在 gen 变了或 Rust 改了文本时靠新的 `epoch` 重建，所以 `Input` 的初始值只在挂载时读一次（草稿模式）。
-- **忙（busy）= 脏或正在编辑**：忙的页面收到外部变更只发提示（`external` 通知），不自动重载。`set_editing/clear_editing` 登记正在编辑的块。
+- **gen（generation）**：每页一个，只在“磁盘内容替换了内存文档”（外部变更重载、载入磁盘版本、冲突后重载）时递增，随 `PageChanged` 事件下发。草稿和操作都带 gen，旧 gen 一律拒绝。TSX 收到 `PageChanged` 后重取页面；若该页正在编辑则提示不自动重载。正在编辑的块用新 `epoch` 重建编辑器（epoch 是 TSX 局部序号，只在 TSX 侧递增），所以 `Input` 的初始值只在挂载时读一次（草稿模式）；Rust 侧文本变化通过事件驱动重取，不反向写入 TSX 的 `Input`。
+- **忙碌（busy）= 脏或正在编辑**：忙碌的页面收到外部变更只发提示（`external` 通知），不自动重载。`setEditing/clearEditing` 登记正在编辑的块；TSX 侧的 `editing` 是调用成功后的投影，Rust 调用失败时 TSX 不更新自己的状态（`endEdit` 先调 `clearEditing` 再清 TSX 状态，失败时编辑器保持打开、可重试）。
 - **结构操作**（`split/indent/outdent/moveUp/moveDown/remove/toggleCollapse/toggleTodo/setTaskDone/undo/redo`）是同步调用，返回 `{ focus, page }`；每行带 Rust 算好的 `markdown`（`[[x]]`、`#tag`、`((uuid))` 已改写成 `sx-page:`/`sx-block:` 链接）和 `rev`。TSX 用 `page` 整页替换并按 `focus` 重新挂编辑器。
-- **事件**：`Rike.onEvent(cb)` 返回的 `Stop` 带注册 id，只撤销自己的注册；没有监听者时事件进积压并在下次注册时合并回放（`IndexVer`、`Pages` 各留一个，`PageChanged` 每页留最新，通知全留）。
+- **补全**：`Rike.complete(query, kind)`（`kind` 为 `"page"`/`"block"`）出候选；块候选用 `Index::search_blocks`（只搜块文本，页面标题命中不能吃掉面板预算）。接受走 `Rike.replace(rel, gen, id, start, end, expected, insert)`（UTF-16 区间拼接，`expected` 必须与当前文本一致，否则报 `StaleText`；`start > end` 报 `InvalidRange`；`focus.caret` 带重建后的光标）。不依赖 `InputRef.insertText`：headless 测试器的 `insert_text` 只追加不替换选区，真实 GTK 平台才是替换。触发器在 TSX（`[[`/`((`），候选面板的 ↑↓/Enter/Tab 用 `keymap`，Esc 不拦（让它走 endEdit）。
+- **事件**：`Rike.onEvent(cb)` 返回的 `Stop` 带注册 id，只撤销自己的注册。没有监听者时事件进积压并在下次注册时合并回放：积压有两层（`session.rs` 的 `backlog` 和 `api.rs` 的 `BACKLOG`），合并规则只有一份——`session.rs::coalesce`，`IndexVer`、`Pages` 各留一个，`PageChanged` 每页留最新，通知全留。加新事件种类时只改这一个函数。
 - **任务标记**只在 `rike_core::task` 里解析，`ops::toggle_todo`、`ops::set_task_done`、`md::render` 共用，不要再写第二份关键字列表。复选框是块文本的兄弟元素，点它不会进入编辑。NSH 的 `Checkbox` 没有自己的外观：必须给 `indicatorClass`/`indicator`，否则它不可见、测试也找不到 `id:task-checkbox`。取消勾选固定回 `TODO`。
 - **视图历史**（`store.ts`）：后退/前进栈上限 100；所有页面切换走 `navigate`，先结束编辑、关搜索，视图不同才入栈并清空前进栈；重载、冲突处理不写历史。`BackHandler.on("press")`（来自 `nsh/mobile`；Linux 上 Alt+←、Back 键、鼠标第 8 键）要在 `installShortcuts` 的 effect 外面注册。`Alt+→` 走 keymap。
 - **撤销**只记录结构操作的整页快照（上限 100）；编辑中的文本撤销交给 `Input`；编辑中不响应 `ctrl+z`。在 Journals 视图里 Ctrl+Z 作用于最近一次结构操作所在的页面（`undoTarget()`）。
-- **退出/切库**：全部走 `Session::leave(verb, path)`（`"quit"` 关窗口，`"switch"` 重启进入另一个库）。TSX 先置 `quitting`（禁用界面），等 100 ms 让最后的 `onChange` 到达，`flushDraft`、`clearEditing`，再调 `Rike.leave`。Rust 侧：取消防抖 → `vault.flush()` → 有页面 stale（未处理的冲突/外部修改）就拒绝并返回提示 → 对每个有改动的页面保存（失败即拒绝）→ 再 flush → 复查；通过后调 `Hooks`（`close_window` / `relaunch`）。拒绝时 `quitting` 复位，可以再试。X 和 Ctrl+Q 不经过这里，是文档化的限制。
+- **退出/切库**：全部走 `Session::leave(verb, path)`（`"quit"` 关窗口，`"switch"` 重启进入另一个库；内部是 `try_leave`/`try_leave_inner` 两层）。进行中的 `leave` 会拒绝第二次调用（“正在退出”），拒绝时 Rust 复位 `quitting`，TSX 跟随返回值复位 `quittingS`。TSX 先置 `quitting`（禁用界面，同时关搜索），等 100 ms 让最后的 `onChange` 到达，`flushDraft`、`clearEditing`，再调 `Rike.leave`。**quitting 期间导航族（`navigate`/`back`/`forward`）和 `acceptDisk`/`keepMine` 直接拒绝**：leave 保存/复查期间不许改 stale 状态或“最后视图”。Rust 侧：取消防抖 → `vault.flush()` → 有页面 stale（未处理的冲突/外部修改）就拒绝并返回提示 → 对每个有改动的页面保存（失败即拒绝）→ 再 flush → 复查；通过后调 `Hooks`（关窗口 / relaunch）。拒绝时 `quitting` 复位，可以再试。X 和 Ctrl+Q 不经过这里，是文档化的限制。
 - **Session 借用**：`Session` 内部是 `RefCell`，同步方法借用后不能跨 `.await` 持有；异步路径先取出需要的数据再 `.await`。
 - **`set_ui_sets` 对整个进程生效**：以后做插件系统时，插件之间无法靠它隔离，要另想办法。
 - **启动**：`startup::decide`——命令行目录（`--vault` 可创建，位置参数必须存在）优先，其次最近的库第一项，否则欢迎页。非 Logseq 的非空文件夹在欢迎页/库菜单里要确认（`Rike.inspect` 返回 `kind`），空文件夹和 Logseq 库直接开。欢迎页打开是原地进入（`Rike.open` + `Rike.start`）；已经开着库时切换要重启进程（`relaunch` 重新执行当前可执行文件，带 `--trace/--fps/--dev-server` 和 `--vault`）。最后的页面记在最近的库文件里（`journals` 或 `page:<rel>`），启动时页面不存在就退回 Journals。
@@ -82,12 +99,12 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
 
 | 组件          | 选择                                                                                                 | 理由                                                                 |
 | ------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| UI            | NSH（Linux GTK 后端），界面用 TSX（`ui/`），git rev `a5036af48ddc193b5023ece9b9196c76b8f8d3f5`，所有 `nsh-*` 用同一个 rev，`nsh` 命令行 0.3.0 | 用户指定。TSX 为以后的插件系统留路，也能热重载。RichEditor 只在 main 上，v0.3.0 没有。 |
+| UI            | NSH（Linux GTK 后端），界面用 TSX（`ui/`），git 依赖跟随上游 main（不锁 rev，具体版本见 `Cargo.lock`；CLI 装最新 main） | 用户指定初版 rev，后升级到 main 拿 `InputRef.insertText`，并改为不锁。TSX 为以后的插件系统留路，也能热重载。RichEditor 的 `suggestion` 补全插件已可用。 |
 | 存储          | `opendal =0.59.5`，仅 `services-fs` 和 `executors-tokio`                                             | 二期同步时本地和远端接口一致。0.x 版本常有破坏性改动，所以精确锁定。 |
 | 监听          | `notify-debouncer-full` 0.7，使用它重新导出的 `notify`                                               | 避免两个版本的 notify。                                              |
 | 哈希          | `blake3`                                                                                             | 判断文件内容是否变化。                                               |
 | Markdown 渲染 | NSH `TextView`（markdown-rs）                                                                        | 只渲染单个块的正文。                                                 |
-| 索引          | `MemIndex`，放在 `Index` trait 后面                                                                  | HawDB 很新、API 常变，所以只作为 M2 的可选后端。                     |
+| 索引          | `MemIndex`，放在 `Index` trait 后面                                                                  | 可重建的派生缓存；后端候选评估见 M2 路线（tantivy 先行，turso/hawdb 后续基准）。 |
 
 ## 数据格式不变量
 
@@ -143,7 +160,12 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
 
 - **keymap 命中即消费**：窗口级快捷键是 capture 阶段的全局快捷键，命中就消费按键，handler 事后才执行，无法放行。TSX 里 `keymap.bind(键, 处理, { when })`：默认在聚焦的输入框用到这个键时不触发；`backspace`、`tab`、`escape`、方向键这类要 `when: "always"`；撤销/重做用 `"notEditing"`。
 - **Wayland 下输入框的 text-input 对象晚于窗口焦点创建**：见“输入法”，不改环境变量就无法使用输入法。
-- **输入法组合期间要卸载绑定**：Linux 的 keymap 没有组合输入保护。`composing()` 信号为真时，快捷键 effect 不绑定任何键（`cleanup` 里解绑），编辑器里的绑定同理；`BackHandler.on` 要在 effect 外面注册，否则组合期间监听器消失。
+- **输入法组合期间要卸载绑定**：Linux 的 keymap 没有组合输入保护。`composing()` 信号为真时，快捷键 effect 不绑定任何键（`cleanup` 里解绑），编辑器里的绑定同理；补全面板在组合中不更新、不接受（preedit 不是块文本）；Editor 的 cleanup 只在自己是当前 epoch 时复位全局 `composing`（重建时旗子归新编辑器）。`BackHandler.on` 要在 effect 外面注册，否则组合期间监听器消失。
+- **vim 模态编辑（M2，设计已定）**：设置项 `vim`（默认关）开启后页面获得两个模式：**normal**（渲染态 + 块选择）和 **insert**（现有块编辑，即 editing()）。Logseq 原生只有块内 Esc，无块间导航；键位参考 Obsidian vimrc 插件 + org-mode 的块导航，保留 Logseq 块概念：
+  - 移动：`j`/`k` 上下选块（可见行，跳过折叠）、`h`/`l` 父块/首子块、`za` 折叠/展开、`gg`/`G` 首末块。
+  - 进入编辑：`i`/`enter` 编辑当前块（caret 在末尾/行首）、`o`/`O` 下/上新建同级块并进入 insert；`esc` 从 insert 回 normal（现有 endEdit）。
+  - 结构操作全部映射现有 `Rike.*` 同步操作：`dd` 删块、`>>`/`<<` 缩进/反缩进、`shift+j`/`shift+k` 块上/下移、`space` 切 TODO、`u`/`ctrl+r` 撤销/重做、`/` 打开搜索。
+  - 实现接缝：normal 模式 = 块选择 signal（rel+id）+ 无编辑器挂载，keymap 绑定在页面级；操作后用返回的 `focus` 更新选择。**NSH keymap 无 chord（多键序列）**：`dd`/`>>`/`<<`/`za`/`gg` 需应用层 pending-key 状态机（一个 pending 变量 + 超时清零），spike 先验证。
 - **Enter 走 `onSubmit`**：`submitBehavior="submit"`，先经过输入法，Shift+Enter 换行。
 - **Linux 上 `onChange` 会延迟**：到主循环空闲、submit 或失焦才送达。所以结构操作前要先 `flushDraft`，退出前先等 100 ms。
 - **Backspace 只在输入为空时上报**。编辑器只在文本为空时绑定 Backspace，回调里再检查一次。
@@ -180,7 +202,7 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
 ## 里程碑边界
 
 - **M1**：大纲、日志、双向链接、搜索、本地文件监听、冲突安全。
-- **M1 不做**：远端同步、HawDB、`{{query}}`、属性 schema、未链接引用、页面重命名、最近页面、多行块的 Up/Down、非空块行首 Backspace 合并、`[[` 自动补全、复制块引用、图谱视图、白板、插件、多窗口、图片附件、导入导出。
+- **M1 不做**：远端同步、HawDB、`{{query}}`、属性 schema、未链接引用、页面重命名、最近页面、多行块的 Up/Down、非空块行首 Backspace 合并、复制块引用、图谱视图、白板、插件、多窗口、图片附件、导入导出。
 - **公式渲染**（`rike-native/src/math.rs`，实验记录在 `docs/spikes/typst-math.md`）：TextView 解析 `$…$`、`$$…$$`、`\(…\)`、`\[…\]` 并区分行内和展示，`ui/src/math.tsx` 是它的 `renderMath` 回调（调 `Rike.renderMath`）。
   - 流程：TeX → `mitex::convert_math` → 加 `PRELUDE`（mitex 为旧版 Typst 写的名字，新 Typst 里要自己定义）和 `RENAMED` 替换 → `typst::compile` → `typst_render` → PNG → `data:` URI → `<Image src>`。字体用 `typst-assets` 内嵌的，不读系统字体。
   - 行内公式的基线：页面里在公式前放一个零宽、透明、7 pt 的 `H` 标记，读它的 y 当基线（分式、纯文字公式在 Typst 里拿不到可靠基线）；`style.translate: [0, height - baseline]` 把图片放到文字基线上。`#set text` 要带 `top-edge/bottom-edge: "bounds"`，否则行内公式高度被钳在文字行高里，分式被裁。
@@ -190,5 +212,6 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
   - `rike_core::inline` 的 tokenizer 会跳过 `$$…$$`、`\(…\)`、`\[…\]`（可跨行，遇到空行放弃），公式里的 `[[x]]`、`#x` 不算引用。
   - 根 `Cargo.toml` 里 `[profile.dev.package."*"] opt-level = 2`：dev 构建里的 Typst 太慢；代价是首次构建约 7 分钟。
 - **退出与切库**：见“界面与原生模块”（`Session::leave`，侧栏按钮 `id:quit` 和 `Ctrl+W`）。
-- **M2**：HawDB 后端、属性类型与 Class 模板（借鉴 Atomic Data 的概念，不嵌入 `atomic_lib`）、未链接引用、页面重命名、简单查询。
+- **M2**：属性类型与 Class 模板（借鉴 Atomic Data 的概念，不嵌入 `atomic_lib`）、未链接引用、页面重命名、简单查询、vim 模态编辑（见下）、中文全文检索。
+- **M2 索引后端路线**（2026-11 评估 HawDB/DuckDB/Turso/seekdb 后定）：① 增量失效已落地：`Index::upsert_page/remove_page` 返回 `PageDelta`，session 累积成 `IndexChanges`（changed/removed rels + 被引用页键）随 `Event::IndexVer` 发给 TS，coalesce 按集合并集合并，TS 侧 backlinks 用 keys 脏检查、搜索用 ver；② 中文全文检索用 **tantivy + jieba** 直接接在 MemIndex 侧（spike 已验证：建 10k 块 93ms、单块增量 commit 53ms、查询全在亚毫秒级，结论见 `docs/spikes/tantivy-fts.md`）；③ 再用同一 `Index` 接缝 spike turso（纯 Rust、活跃，但 FTS 实验性）和 hawdb（同步 facade 默认可用、图+FTS 一体，但 v0.30、API 常变、单公司自用库）各一个最小实现，用同一基准（万页 upsert + 中文查询）定默认后端。DuckDB（OLAP 不匹配、CJK 弱）和 seekdb（无 Rust SDK、向量定位）排除。所有后端都只是可重建的派生缓存，Markdown 是唯一数据源。
 - **M3**：OpenDAL 远端同步（webdav/s3、三方合并、tombstone）；RichEditor 实验（工程已删除，结论在 `docs/spikes/rich-editor.md`）是：：`[[x]]` 往返会被转义，要先给 schema 加 `pageRef`/`tag`/`blockRef` 节点才能考虑换编辑器。
