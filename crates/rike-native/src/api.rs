@@ -16,6 +16,9 @@ use nsh_core::file_dialog::OpenDialog;
 use nsh_core::prelude::*;
 use rike_core::BlockId;
 use rike_index::{BacklinkGroup, BlockInfo, PageEntry, SearchHit};
+
+/// How many completion candidates one panel shows.
+const COMPLETE_LIMIT: usize = 8;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -112,6 +115,9 @@ pub struct PageViewDto {
 pub struct FocusDto {
     pub id: String,
     pub caret_start: bool,
+    /// An absolute caret for the rebuilt editor (UTF-16 units), for ops that
+    /// rewrite the block's text in place.
+    pub caret: Option<u32>,
 }
 
 /// The result of a structure operation.
@@ -163,6 +169,17 @@ pub struct BacklinkGroupDto {
     pub rel: String,
     pub title: String,
     pub items: Vec<BacklinkItemDto>,
+}
+
+/// One completion candidate: `kind` is `"page"` or `"block"`; `insert` is
+/// the text to put in place of the query (closing the reference), `label`
+/// and `detail` what the panel shows.
+#[derive(Debug, Clone, JsObject)]
+pub struct CompleteItemDto {
+    pub kind: String,
+    pub insert: String,
+    pub label: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, JsObject)]
@@ -316,10 +333,17 @@ fn page_dto(page: PageView) -> PageViewDto {
 
 fn op_dto(result: OpResult) -> OpResultDto {
     OpResultDto {
-        focus: result.focus.map(|Focus { id, caret_start }| FocusDto {
-            id: id_text(id),
-            caret_start,
-        }),
+        focus: result.focus.map(
+            |Focus {
+                 id,
+                 caret_start,
+                 caret,
+             }| FocusDto {
+                id: id_text(id),
+                caret_start,
+                caret: caret.map(|c| u32::try_from(c).unwrap_or(u32::MAX)),
+            },
+        ),
         page: page_dto(result.page),
     }
 }
@@ -473,19 +497,12 @@ fn deliver(event: Event) {
 }
 
 /// Keeps one `IndexVer`, one `Pages` and the newest `PageChanged` per page;
-/// notices all stay.
+/// notices all stay. Delegates to `session::coalesce` so both backlog layers
+/// share one rule set.
 fn coalesce(events: Vec<Event>) -> Vec<Event> {
     let mut out: Vec<Event> = Vec::new();
     for event in events {
-        match &event {
-            Event::IndexVer(_) => out.retain(|e| !matches!(e, Event::IndexVer(_))),
-            Event::Pages => out.retain(|e| !matches!(e, Event::Pages)),
-            Event::PageChanged { rel, .. } => {
-                out.retain(|e| !matches!(e, Event::PageChanged { rel: other, .. } if other == rel))
-            }
-            Event::Notice(_) => {}
-        }
-        out.push(event);
+        session::coalesce(&mut out, event);
     }
     out
 }
@@ -712,6 +729,32 @@ impl Rike {
             .map_err(err)
     }
 
+    /// Replaces the UTF-16 range `[start, end)` of a block's text with
+    /// `insert`: how a completion candidate is accepted. `expected` must be
+    /// what the range holds now, or the op is refused.
+    pub fn replace(
+        rel: String,
+        generation: u64,
+        id: String,
+        start: u32,
+        end: u32,
+        expected: String,
+        insert: String,
+    ) -> Result<OpResultDto, String> {
+        session()?
+            .replace_range(
+                &rel,
+                generation,
+                block_id(&id)?,
+                start as usize,
+                end as usize,
+                &expected,
+                &insert,
+            )
+            .map(op_dto)
+            .map_err(err)
+    }
+
     pub fn indent(
         rel: String,
         generation: u64,
@@ -832,6 +875,21 @@ impl Rike {
         Ok(session()?.search(&query).into_iter().map(hit_dto).collect())
     }
 
+    /// Completion candidates after a trigger: `kind` is `"page"` (for `[[`)
+    /// or `"block"` (for `((`).
+    pub fn complete(query: String, kind: String) -> Result<Vec<CompleteItemDto>, String> {
+        Ok(session()?
+            .complete(&query, &kind, COMPLETE_LIMIT)
+            .into_iter()
+            .map(|c| CompleteItemDto {
+                kind: c.kind,
+                insert: c.insert,
+                label: c.label,
+                detail: c.detail,
+            })
+            .collect())
+    }
+
     pub fn backlinks(rel: String) -> Result<Vec<BacklinkGroupDto>, String> {
         let session = session()?;
         Ok(session
@@ -880,11 +938,12 @@ impl Rike {
         })
     }
 
-    /// Remembers where the user is, for the next start.
+    /// Remembers where the user is, for the next start. The session does not
+    /// track the view: it is UI state, persisted here for the next boot.
     pub fn set_view(view: ViewDto) -> Result<(), String> {
         let view = view_of(&view);
+        session()?;
         persist_view(&view);
-        session()?.set_view(view);
         Ok(())
     }
 

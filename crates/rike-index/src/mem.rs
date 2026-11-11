@@ -5,8 +5,8 @@ use rike_core::inline::{InlineKind, tokenize};
 use rike_core::names::PageKey;
 
 use crate::{
-    BacklinkGroup, BacklinkItem, BlockInfo, Index, IndexWarning, PageEntry, PageSource, SearchHit,
-    resolve_title,
+    BacklinkGroup, BacklinkItem, BlockHit, BlockInfo, Index, IndexWarning, PageEntry, PageSource,
+    SearchHit, resolve_title,
 };
 
 struct BlockRecord {
@@ -279,6 +279,29 @@ impl Index for MemIndex {
             for block in &page.blocks {
                 if block.lower.contains(&query) {
                     hits.push(SearchHit::Block {
+                        page: page.entry.clone(),
+                        block: block.id,
+                        text: block.text.clone(),
+                    });
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    fn search_blocks(&self, query: &str, limit: usize) -> Vec<BlockHit> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for page in self.ordered() {
+            for block in &page.blocks {
+                if block.lower.contains(&query) {
+                    hits.push(BlockHit {
                         page: page.entry.clone(),
                         block: block.id,
                         text: block.text.clone(),

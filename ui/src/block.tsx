@@ -12,17 +12,18 @@ import { Button, Checkbox, Input, TextView } from "nsh/base";
 import type { TextViewLinkPressEvent } from "nsh/base";
 import type { InputRef } from "nsh";
 import { Rike } from "rike";
-import type { OpResultDto, RowDto } from "rike";
+import type { CompleteItemDto, OpResultDto, RowDto } from "rike";
 import { renderMath } from "./math";
 import {
 	type Editing,
-	clearFocusRequest,
 	editing,
 	endEdit,
 	moveFocus,
 	noteDraft,
 	openBlock,
 	openPageByTitle,
+	registerEditorText,
+	unregisterEditorText,
 	runOp,
 	setComposing,
 	setTaskDone,
@@ -31,6 +32,37 @@ import {
 } from "./store";
 
 const INDENT = 24;
+
+/** How many candidates one completion panel shows; keep in step with Rust's `COMPLETE_LIMIT`. */
+const COMPLETE_LIMIT = 8;
+
+/** An open completion panel: the trigger's kind, where the query sits in the
+ * text (UTF-16 units), and the candidates. */
+type Completion = {
+	kind: "page" | "block";
+	from: number;
+	to: number;
+	/** What the range holds now: `replace` refuses if it changed. */
+	query: string;
+	items: CompleteItemDto[];
+};
+
+/** The completion trigger `text` has just before `caret` (`[[` or `((` not
+ * yet closed), or null. `from`/`to` bracket the query. */
+function triggerAt(
+	text: string,
+	caret: number,
+): { kind: "page" | "block"; from: number; to: number } | null {
+	for (let i = caret - 2; i >= 0; i--) {
+		const pair = text.slice(i, i + 2);
+		if (pair === "[[") return { kind: "page", from: i + 2, to: caret };
+		if (pair === "((") return { kind: "block", from: i + 2, to: caret };
+		const ch = text[i + 1];
+		if (ch === "\n" || ch === "]" || ch === ")" || ch === "[" || ch === "(")
+			return null;
+	}
+	return null;
+}
 
 /** A press on a `sx-page:` / `sx-block:` link of a block's Markdown. */
 export function onLinkPress(e: TextViewLinkPressEvent): void {
@@ -151,33 +183,113 @@ function Editor(props: {
 	const initial = untracked(() => props.row().text);
 	const text = signal(initial);
 	const composing = signal(false);
+	// The store flushes drafts from here, so it always sees the input's
+	// actual text, not just the last `onChange` value.
+	registerEditorText(edit.epoch, () => text());
 	// An editor that goes away mid-composition never hears composing=false.
-	cleanup(() => setComposing(false));
+	// A rebuild (new epoch) hands the composing flag to the new editor: only
+	// reset the global one when this editor is still the current one.
+	cleanup(() => {
+		unregisterEditorText(edit.epoch);
+		// A rebuild hands the composing flag to the new editor; a plain endEdit
+		// (editing() already null) must still reset it.
+		const cur = editing();
+		if (cur && cur.epoch !== edit.epoch) return;
+		setComposing(false);
+		composing.set(false);
+	});
 	const empty = computed(() => text() === "");
 	const single = computed(() => !text().includes("\n"));
-	let caret: number | null = null;
+	// The caret as far as we know it before the first selection event: a
+	// rebuilt editor starts at `caret`/`caretStart`, a fresh one has none.
+	let caret: number | null = edit.caret ?? (edit.caretStart ? 0 : null);
 	let input: InputRef | undefined;
 
 	const mine = () => editing()?.epoch === edit.epoch;
 	const op = (f: (g: number, t: string) => OpResultDto) =>
 		runOp(rel, (g) => f(g, text()));
 
+	// Completion: opens on `[[` (pages) or `((` (blocks) with the caret inside,
+	// closes when the trigger is gone.
+	const compl = signal<Completion | null>(null);
+	const complSel = signal(0);
+	const updateCompl = (t: string, at: number) => {
+		// Preedit text is not real block text: never open the panel on it, and
+		// let an open panel sit still instead of chasing IME-internal offsets.
+		if (composing()) return;
+		const tr = triggerAt(t, at);
+		if (!tr || (tr.kind === "block" && t.slice(tr.from, tr.to).trim() === "")) {
+			compl.set(null);
+			return;
+		}
+		try {
+			const query = t.slice(tr.from, tr.to);
+			const items = Rike.complete(query, tr.kind);
+			compl.set(items.length ? { ...tr, query, items } : null);
+			complSel.set(0);
+		} catch {
+			compl.set(null);
+		}
+	};
+	const accept = (item: CompleteItemDto | undefined) => {
+		const c = compl();
+		// Accepting rebuilds the editor, which would cut an IME session short.
+		if (!c || !item || !mine() || composing()) return;
+		compl.set(null);
+		// Through Rust: the editor is rebuilt from the model with the caret
+		// after the inserted text. (`InputRef.insertText` cannot replace a
+		// range in the headless runner, so the panel never relies on it.)
+		runOp(rel, (g) =>
+			Rike.replace(rel, g, id, c.from, c.to, c.query, item.insert),
+		);
+	};
+	// The panel's keys. `escape` is left alone: it ends the edit (and the
+	// panel with it), matching the shortcuts' single handler.
+	effect(() => {
+		if (composing()) return;
+		const c = compl();
+		if (!c) return;
+		const n = Math.min(c.items.length, COMPLETE_LIMIT);
+		const offs = [
+			keymap.bind(
+				"down",
+				() => complSel.set((complSel() + 1) % n),
+				{ when: "always" },
+			),
+			keymap.bind(
+				"up",
+				() => complSel.set((complSel() - 1 + n) % n),
+				{ when: "always" },
+			),
+			keymap.bind("enter", () => accept(c.items[complSel()]), { when: "always" }),
+			keymap.bind("tab", () => accept(c.items[complSel()]), { when: "always" }),
+		];
+		cleanup(() => offs.forEach((off) => off()));
+	});
+
 	if (edit.caretStart) {
 		setTimeout(() => input?.setSelection(0, 0), 0);
+	} else if (edit.caret !== undefined) {
+		setTimeout(() => input?.setSelection(edit.caret!, edit.caret!), 0);
 	}
-	clearFocusRequest();
 
 	// Editing keys exist only while no input method is composing: the Linux keymap has no
 	// composition guard, so a bound Enter/Backspace/arrow would eat the IME's keys.
 	effect(() => {
 		if (composing()) return;
 		const offs = [
-			keymap.bind("tab", () => op((g, t) => Rike.indent(rel, g, id, t)), {
-				when: "always",
-			}),
+			keymap.bind(
+				"tab",
+				() => {
+					if (!compl()) op((g, t) => Rike.indent(rel, g, id, t));
+				},
+				{ when: "always" },
+			),
 			keymap.bind(
 				"shift+tab",
-				() => op((g, t) => Rike.outdent(rel, g, id, t)),
+				() => {
+					if (!compl()) op((g, t) => Rike.outdent(rel, g, id, t));
+				},
 				{ when: "always" },
 			),
 			keymap.bind(
@@ -192,7 +304,9 @@ function Editor(props: {
 			),
 			keymap.bind(
 				"ctrl+enter",
-				() => op((g, t) => Rike.toggleTodo(rel, g, id, t)),
+				() => {
+					if (!compl()) op((g, t) => Rike.toggleTodo(rel, g, id, t));
+				},
 				{ when: "always" },
 			),
 		];
@@ -207,16 +321,29 @@ function Editor(props: {
 		}
 		if (single()) {
 			offs.push(
-				keymap.bind("up", () => moveFocus(rel, id, -1), { when: "always" }),
+				keymap.bind(
+					"up",
+					() => {
+						if (!compl()) moveFocus(rel, id, -1);
+					},
+					{ when: "always" },
+				),
 			);
 			offs.push(
-				keymap.bind("down", () => moveFocus(rel, id, 1), { when: "always" }),
+				keymap.bind(
+					"down",
+					() => {
+						if (!compl()) moveFocus(rel, id, 1);
+					},
+					{ when: "always" },
+				),
 			);
 		}
 		cleanup(() => offs.forEach((off) => off()));
 	});
 
 	return (
+		<View style={{ flexDirection: "column", width: "100%" }}>
 		<Input
 			testID="block-input"
 			ref={(r: InputRef) => {
@@ -228,10 +355,14 @@ function Editor(props: {
 			submitBehavior="submit"
 			onChange={(e) => {
 				text.set(e.value);
-				if (mine()) noteDraft(rel, id, e.value);
+				if (mine()) {
+					noteDraft(rel, id, e.value);
+					updateCompl(e.value, caret ?? e.value.length);
+				}
 			}}
 			onSelectionChange={(e) => {
 				caret = e.start;
+				updateCompl(text(), e.start);
 			}}
 			onCompositionChange={(e) => {
 				composing.set(e.composing);
@@ -247,5 +378,39 @@ function Editor(props: {
 			}}
 			style={{ width: "100%", padding: 4, minHeight: 26, fontSize: 14 }}
 		/>
+		<If when={compl()}>
+			{(c) => (
+				<View
+					testID="complete-panel"
+					style={{ flexDirection: "column", marginTop: 2 }}
+				>
+					<Each
+						of={c().items.slice(0, COMPLETE_LIMIT)}
+						key={(item: CompleteItemDto) => `${item.kind}:${item.label}:${item.detail}`}
+					>
+						{(item: () => CompleteItemDto, index: () => number) => (
+							<Button
+								testID="complete-item"
+								onPress={() => accept(item())}
+								style={{ paddingVertical: 2, paddingHorizontal: 8 }}
+							>
+								<Text
+									class={
+										index() === complSel() ? "text-primary" : "text-muted-foreground"
+									}
+									style={{ fontSize: 13 }}
+								>
+									{item().kind === "block"
+										? `((${item().label}`
+										: `[[${item().label}`}
+									{item().detail ? ` — ${item().detail}` : ""}
+								</Text>
+							</Button>
+						)}
+					</Each>
+				</View>
+			)}
+		</If>
+		</View>
 	);
 }

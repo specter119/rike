@@ -65,10 +65,11 @@ export type Editing = {
 	rel: string;
 	id: string;
 	caretStart: boolean;
+	/** An absolute caret (UTF-16) for a rebuilt editor; takes precedence. */
+	caret?: number;
 	epoch: number;
 };
 const editingS = signal<Editing | null>(null);
-const focusRequestS = signal<{ id: string; caretStart: boolean } | null>(null);
 let editEpoch = 0;
 let draft: {
 	rel: string;
@@ -77,6 +78,18 @@ let draft: {
 	generation: number;
 } | null = null;
 let draftTimer: number | undefined;
+
+// The live input's text, registered by the mounted editor. Between `onChange`
+// events the input's own text outranks the last captured value.
+let editorText: { epoch: number; get: () => string } | null = null;
+
+export function registerEditorText(epoch: number, get: () => string): void {
+	editorText = { epoch, get };
+}
+
+export function unregisterEditorText(epoch: number): void {
+	if (editorText?.epoch === epoch) editorText = null;
+}
 
 const composingS = signal(false);
 
@@ -99,8 +112,6 @@ export const leaveNotice: () => string | null = leaveNoticeS;
 export const pendingConfirm: () => { path: string; kind: "other" } | null =
 	pendingConfirmS;
 export const editing: () => Editing | null = editingS;
-export const focusRequest: () => { id: string; caretStart: boolean } | null =
-	focusRequestS;
 /** True while an input method is composing text: key bindings must not be mounted then. */
 export const composing: () => boolean = composingS;
 export function setComposing(on: boolean): void {
@@ -312,6 +323,7 @@ function syncHistory(): void {
 }
 
 export function navigate(v: View): void {
+	if (quittingS()) return;
 	endEdit();
 	searchOpenS.set(false);
 	const current = viewS();
@@ -327,6 +339,7 @@ export function navigate(v: View): void {
 }
 
 export function back(): void {
+	if (quittingS()) return;
 	const target = backStack.pop();
 	if (!target) return;
 	endEdit();
@@ -340,6 +353,7 @@ export function back(): void {
 }
 
 export function forward(): void {
+	if (quittingS()) return;
 	const target = forwardStack.pop();
 	if (!target) return;
 	endEdit();
@@ -406,12 +420,15 @@ export function startEdit(rel: string, id: string, caretStart = false): void {
 export function endEdit(): void {
 	flushDraft();
 	if (!editingS()) return;
-	editingS.set(null);
+	// Clear the Rust side first: only once that call has gone through do the
+	// two sides agree. If it throws, the editor stays up and the user can
+	// retry, instead of the states diverging.
 	try {
 		Rike.clearEditing();
 	} catch {
-		// No session: nothing to clear.
+		// No session: the Rust side holds no editing state either.
 	}
+	editingS.set(null);
 }
 
 /** Remembers the editor's latest text and sends it after a short pause. No redraw. */
@@ -435,18 +452,26 @@ export function flushDraft(): string | undefined {
 	const d = draft;
 	if (!d) return undefined;
 	draft = null;
+	// The live input is the authority: its current text outranks the last
+	// captured `onChange` value, which can lag behind on Linux. It is only
+	// trusted for the same block the draft belongs to.
+	const live = editingS();
+	const text =
+		live &&
+		editorText &&
+		editorText.epoch === live.epoch &&
+		live.rel === d.rel &&
+		live.id === d.id
+			? editorText.get()
+			: d.text;
 	try {
-		if (!Rike.setDraft(d.rel, d.generation, d.id, d.text)) {
+		if (!Rike.setDraft(d.rel, d.generation, d.id, text)) {
 			toast("页面已从磁盘重新载入，未保存的输入被丢弃", "info");
 		}
 	} catch (e) {
 		fail(e);
 	}
-	return d.text;
-}
-
-export function clearFocusRequest(): void {
-	focusRequestS.set(null);
+	return text;
 }
 
 function applyOp(res: OpResultDto): void {
@@ -466,9 +491,9 @@ function applyOp(res: OpResultDto): void {
 				rel: res.page.rel,
 				id: focus.id,
 				caretStart: focus.caretStart,
+				caret: focus.caret ?? undefined,
 				epoch: editEpoch,
 			});
-			focusRequestS.set({ id: focus.id, caretStart: focus.caretStart });
 		}
 	});
 }
@@ -527,11 +552,13 @@ export function toggleCollapse(rel: string, id: string): void {
 }
 
 export function acceptDisk(rel: string): void {
+	if (quittingS()) return;
 	endEdit();
 	Rike.acceptDisk(rel).then(putPage).catch(fail);
 }
 
 export function keepMine(rel: string): void {
+	if (quittingS()) return;
 	try {
 		Rike.keepMine(rel);
 	} catch (e) {
@@ -550,6 +577,7 @@ function sleep(ms: number): Promise<void> {
 async function leave(verb: "quit" | "switch", path?: string): Promise<void> {
 	if (quittingS()) return;
 	leaveNoticeS.set(null);
+	searchOpenS.set(false);
 	// Disable the UI first, then give the last `onChange` a moment to arrive.
 	quittingS.set(true);
 	try {

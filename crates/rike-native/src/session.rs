@@ -143,6 +143,9 @@ pub struct Focus {
     pub id: BlockId,
     /// A split puts the caret at the start of the new block.
     pub caret_start: bool,
+    /// An absolute caret for the rebuilt editor (UTF-16 units), for ops that
+    /// rewrite the block's text in place.
+    pub caret: Option<usize>,
 }
 
 /// Result of a structure op: the model changed and the page was saved (or
@@ -201,6 +204,10 @@ pub enum SessionError {
     NoBlock { rel: String, id: BlockId },
     #[error("an edit is still open")]
     Editing,
+    #[error("invalid text range [{start}, {end})")]
+    InvalidRange { start: usize, end: usize },
+    #[error("the block text changed since the completion opened")]
+    StaleText,
     #[error("nothing to undo or redo for {0}")]
     NoHistory(String),
     #[error(transparent)]
@@ -461,6 +468,17 @@ fn in_runtime<F: Future>(handle: Handle, future: F) -> impl Future<Output = F::O
     }
 }
 
+/// One completion candidate: what the panel shows and what to insert
+/// after the trigger (`[[` or `((`).
+pub struct CompleteItem {
+    pub kind: String,
+    /// Text to insert in place of the query, closing the reference.
+    pub insert: String,
+    pub label: String,
+    /// The source page's title for a block candidate, else empty.
+    pub detail: String,
+}
+
 /// Messages from the session to its pump.
 enum PumpMsg {
     SaveNow(String),
@@ -501,7 +519,6 @@ struct Inner {
     redo: Vec<(String, Page)>,
     notices: Vec<Notice>,
     next_notice: u64,
-    view: View,
     quitting: bool,
     /// Once `leave` starts the pump stops scheduling new saves.
     leaving: bool,
@@ -544,7 +561,6 @@ impl Session {
                 redo: Vec::new(),
                 notices: Vec::new(),
                 next_notice: 1,
-                view: View::Journals,
                 quitting: false,
                 leaving: false,
                 index_ver: 0,
@@ -991,6 +1007,7 @@ impl Session {
                     changed.then_some(Focus {
                         id,
                         caret_start: false,
+                        caret: None,
                     }),
                 )
             });
@@ -1007,6 +1024,7 @@ impl Session {
                     Some(Focus {
                         id: new_id,
                         caret_start: true,
+                        caret: None,
                     }),
                 ),
                 None => (false, None),
@@ -1072,6 +1090,7 @@ impl Session {
                 changed.then_some(Focus {
                     id,
                     caret_start: false,
+                    caret: None,
                 }),
             )
         })
@@ -1096,6 +1115,7 @@ impl Session {
                     Some(Focus {
                         id: focus,
                         caret_start: false,
+                        caret: None,
                     }),
                 ),
                 None => (false, None),
@@ -1132,6 +1152,7 @@ impl Session {
                 changed.then_some(Focus {
                     id,
                     caret_start: false,
+                    caret: None,
                 }),
             )
         })
@@ -1147,6 +1168,57 @@ impl Session {
     ) -> Result<OpResult, SessionError> {
         self.structure_op(rel, r#gen, id, None, |page, id| {
             (ops::set_task_done(page, id, done), None)
+        })
+    }
+
+    /// Replaces the UTF-16 range `[start, end)` of a block's text with
+    /// `insert` (a completion acceptance, say). `expected` must be what the
+    /// range currently holds: the panel's offsets were taken from an older
+    /// snapshot, and a page that changed underneath must not be spliced.
+    /// The editor is rebuilt with the caret after the inserted text.
+    // The (start, end, expected, insert) shape mirrors the wire format; a
+    // struct would move the noise, not remove it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_range(
+        &self,
+        rel: &str,
+        r#gen: u64,
+        id: BlockId,
+        start: usize,
+        end: usize,
+        expected: &str,
+        insert: &str,
+    ) -> Result<OpResult, SessionError> {
+        if start > end {
+            return Err(SessionError::InvalidRange { start, end });
+        }
+        let text = self
+            .inner
+            .borrow()
+            .docs
+            .get(rel)
+            .and_then(|ps| ps.doc.page.find(id))
+            .map(|b| b.text.clone())
+            .ok_or_else(|| SessionError::NoBlock {
+                rel: rel.to_owned(),
+                id,
+            })?;
+        let b_start = utf16_to_byte(&text, start);
+        let b_end = utf16_to_byte(&text, end);
+        if text.get(b_start..b_end) != Some(expected) {
+            return Err(SessionError::StaleText);
+        }
+        let new_text = format!("{}{insert}{}", &text[..b_start], &text[b_end..]);
+        let caret = start.saturating_add(insert.encode_utf16().count());
+        self.structure_op(rel, r#gen, id, Some(new_text), move |_, id| {
+            (
+                false,
+                Some(Focus {
+                    id,
+                    caret_start: false,
+                    caret: Some(caret),
+                }),
+            )
         })
     }
 
@@ -1564,6 +1636,47 @@ impl Session {
         self.inner.borrow().index.block(id)
     }
 
+    /// Completion candidates after a trigger: `kind` is `"page"` (for `[[`)
+    /// or `"block"` (for `((`). Pages match the title by prefix first, then
+    /// substring; blocks match their text as a substring.
+    pub fn complete(&self, query: &str, kind: &str, limit: usize) -> Vec<CompleteItem> {
+        let i = self.inner.borrow();
+        let q = query.trim().to_lowercase();
+        let mut out = Vec::new();
+        if kind == "block" {
+            if q.is_empty() {
+                return out;
+            }
+            for hit in i.index.search_blocks(&q, limit) {
+                let label: String = hit.text.chars().take(60).collect();
+                out.push(CompleteItem {
+                    kind: "block".into(),
+                    insert: format!("{})) ", hit.block.0),
+                    label,
+                    detail: hit.page.title,
+                });
+            }
+            return out;
+        }
+        let (mut starts, mut rest) = (Vec::new(), Vec::new());
+        for page in i.index.pages() {
+            let t = page.title.to_lowercase();
+            if q.is_empty() || t.starts_with(&q) {
+                starts.push(page);
+            } else if t.contains(&q) {
+                rest.push(page);
+            }
+        }
+        starts.extend(rest);
+        out.extend(starts.into_iter().take(limit).map(|page| CompleteItem {
+            kind: "page".into(),
+            insert: format!("{}]] ", page.title),
+            label: page.title,
+            detail: String::new(),
+        }));
+        out
+    }
+
     /// Non-journal pages by title, for the sidebar.
     pub fn pages(&self) -> Vec<PageEntry> {
         self.inner
@@ -1586,14 +1699,6 @@ impl Session {
             return format!("journals/{}.md", i.config.journal.format_file_stem(date));
         }
         format!("pages/{}.md", title_to_file_stem(title))
-    }
-
-    pub fn set_view(&self, view: View) {
-        self.inner.borrow_mut().view = view;
-    }
-
-    pub fn current_view(&self) -> View {
-        self.inner.borrow().view.clone()
     }
 
     pub fn today(&self) -> JournalDate {
@@ -1972,8 +2077,9 @@ fn rearm_save_timer(timer: &mut Pin<Box<Sleep>>, deadlines: &HashMap<String, Ins
 }
 
 /// Backlog coalescing: one PageChanged per page, one IndexVer, one Pages;
-/// notices all survive.
-fn coalesce(backlog: &mut Vec<Event>, event: Event) {
+/// notices all survive. The single source of truth: the api layer replays
+/// its own listener backlog through the same function.
+pub(crate) fn coalesce(backlog: &mut Vec<Event>, event: Event) {
     match &event {
         Event::PageChanged { rel, .. } => {
             backlog.retain(|e| !matches!(e, Event::PageChanged { rel: r, .. } if r == rel));

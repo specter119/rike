@@ -46,6 +46,14 @@ pub struct BacklinkGroup {
     pub items: Vec<BacklinkItem>,
 }
 
+/// A block matching a search, with its page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockHit {
+    pub page: PageEntry,
+    pub block: BlockId,
+    pub text: String,
+}
+
 /// Where a block lives; used to render `((uuid))` and to navigate to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockInfo {
@@ -95,6 +103,10 @@ pub trait Index {
     /// Case-insensitive substring search over titles and block text.
     /// Title matches come first.
     fn search(&self, query: &str, limit: usize) -> Vec<SearchHit>;
+
+    /// Case-insensitive substring search over block text only, so page title
+    /// hits cannot eat the completion panel's budget.
+    fn search_blocks(&self, query: &str, limit: usize) -> Vec<BlockHit>;
 
     fn warnings(&self) -> Vec<IndexWarning>;
 }

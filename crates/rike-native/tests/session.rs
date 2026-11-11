@@ -546,7 +546,8 @@ fn structure_ops_return_focus_and_page_and_save() {
             result.focus,
             Some(session::Focus {
                 id: focus.id,
-                caret_start: false
+                caret_start: false,
+                caret: None
             })
         );
 
@@ -589,7 +590,8 @@ fn structure_ops_return_focus_and_page_and_save() {
             result.focus,
             Some(session::Focus {
                 id,
-                caret_start: false
+                caret_start: false,
+                caret: None
             })
         );
         f.pump.abort();
