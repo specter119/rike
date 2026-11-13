@@ -5,6 +5,7 @@ import {
 	keymap,
 	signal,
 	Text,
+	token,
 	untracked,
 	View,
 } from "nsh";
@@ -120,6 +121,7 @@ export function Block(props: {
 	);
 }
 
+/** The mark at the start of a block: a dot on a leaf, a chevron on a block that folds. */
 function Bullet(props: { rel: string; row: () => RowDto }) {
 	const id = untracked(() => props.row().id);
 	return (
@@ -128,11 +130,28 @@ function Bullet(props: { rel: string; row: () => RowDto }) {
 			onPress={() => {
 				if (props.row().hasChildren) toggleCollapse(props.rel, id);
 			}}
-			style={{ width: 18, flexShrink: 0, paddingVertical: 4 }}
+			hoverStyle={{ opacity: 0.6 }}
+			style={{ width: 18, flexShrink: 0, paddingTop: 7, alignItems: "flex-start" }}
 		>
-			<Text class="text-muted-foreground" style={{ fontSize: 14 }}>
-				{props.row().hasChildren ? (props.row().collapsed ? "▸" : "▾") : "•"}
-			</Text>
+			<If
+				when={props.row().hasChildren}
+				else={
+					<View
+						style={{
+							width: 5,
+							height: 5,
+							marginTop: 3,
+							borderRadius: 3,
+							backgroundColor: token("muted-foreground"),
+							opacity: 0.5,
+						}}
+					/>
+				}
+			>
+				<Text class="text-muted-foreground" style={{ fontSize: 9, lineHeight: 11 }}>
+					{props.row().collapsed ? "▸" : "▾"}
+				</Text>
+			</If>
 		</Button>
 	);
 }
@@ -146,14 +165,14 @@ function TaskMarker(props: { rel: string; row: () => RowDto }) {
 	return (
 		<View style={{ flexDirection: "row", flexShrink: 0 }}>
 			<If when={task() !== null && task() !== "CANCELED"}>
-				<View style={{ width: 22, paddingVertical: 4 }}>
+				<View style={{ width: 20, paddingTop: 5 }}>
 					<Checkbox
 						testID="task-checkbox"
 						checked={task() === "DONE"}
 						onChange={(e) => setTaskDone(props.rel, id, e.checked)}
-						indicatorClass="h-4 w-4 rounded border border-border items-center justify-center checked:bg-primary"
+						indicatorClass="h-4 w-4 rounded border border-input items-center justify-center checked:bg-foreground checked:border-foreground"
 						indicator={
-							<Text class="text-primary-foreground" style={{ fontSize: 11 }}>
+							<Text class="text-background" style={{ fontSize: 10 }}>
 								{task() === "DONE" ? "✓" : ""}
 							</Text>
 						}
@@ -163,7 +182,13 @@ function TaskMarker(props: { rel: string; row: () => RowDto }) {
 			<If when={LABELLED.includes(task() ?? "")}>
 				<Text
 					class="text-muted-foreground"
-					style={{ fontSize: 10, paddingVertical: 4, paddingRight: 4 }}
+					style={{
+						fontSize: 9.5,
+						fontFamily: token("font-mono"),
+						letterSpacing: 0.6,
+						paddingTop: 6,
+						paddingRight: 6,
+					}}
 				>
 					{task() ?? ""}
 				</Text>

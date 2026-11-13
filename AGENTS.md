@@ -57,6 +57,8 @@ docs/spikes/           探针与实验结论（tsx.md 是迁移到 TSX 的结论
 | 编辑登记（busy） | Rust `Edit` | `setEditing`/`clearEditing`；TSX 只在 Rust 调用成功后更新自己的 `editing` |
 | 编辑器当前文本 | 挂载的 `Input`（TSX） | `flushDraft` → `setDraft`；`Input` 卸载后回退到 `noteDraft` 捕获值 |
 | 页面缓存（`pageMap`） | TSX | `page`/`PageChanged` 事件失效 + 重取 |
+| 页面列表（`catalog`） | Rust `session.rs` | `Pages` 事件；索引未就绪时它是列表的权威 |
+| 后台索引进度 | Rust `session.rs` | `IndexProgress` 事件（`done`/`total`/`indexing`） |
 | 视图/历史栈、本地 toast（负 id）、`quitting` 的 UI 投影 | TSX `store.ts` | `navigate`；退出结果跟随 `Rike.leave` 返回值 |
 | 通知（正 id） | Rust `notices` | `notify` 事件推送 |
 | 事件积压合并 | `session.rs::coalesce`（唯一实现） | Session backlog 和 api `BACKLOG` 两层共用同一函数 |
@@ -83,6 +85,9 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
 - **忙碌（busy）= 脏或正在编辑**：忙碌的页面收到外部变更只发提示（`external` 通知），不自动重载。`setEditing/clearEditing` 登记正在编辑的块；TSX 侧的 `editing` 是调用成功后的投影，Rust 调用失败时 TSX 不更新自己的状态（`endEdit` 先调 `clearEditing` 再清 TSX 状态，失败时编辑器保持打开、可重试）。
 - **结构操作**（`split/indent/outdent/moveUp/moveDown/remove/toggleCollapse/toggleTodo/setTaskDone/undo/redo`）是同步调用，返回 `{ focus, page }`；每行带 Rust 算好的 `markdown`（`[[x]]`、`#tag`、`((uuid))` 已改写成 `sx-page:`/`sx-block:` 链接）和 `rev`。TSX 用 `page` 整页替换并按 `focus` 重新挂编辑器。
 - **补全**：`Rike.complete(query, kind)`（`kind` 为 `"page"`/`"block"`）出候选；块候选用 `Index::search_blocks`（只搜块文本，页面标题命中不能吃掉面板预算）。接受走 `Rike.replace(rel, gen, id, start, end, expected, insert)`（UTF-16 区间拼接，`expected` 必须与当前文本一致，否则报 `StaleText`；`start > end` 报 `InvalidRange`；`focus.caret` 带重建后的光标）。不依赖 `InputRef.insertText`：headless 测试器的 `insert_text` 只追加不替换选区，真实 GTK 平台才是替换。触发器在 TSX（`[[`/`((`），候选面板的 ↑↓/Enter/Tab 用 `keymap`，Esc 不拦（让它走 endEdit）。
+- **启动与后台索引**：`start()` 只读 `config.edn` 和 `list_pages()`，用 `catalog_of` 从文件名/日记格式反解出 `catalog`，然后立刻返回；全量解析进 `pending_index`，由 pump 每轮处理一页，每 32 页 `commit()` 一次让搜索中途可用，队列排空时 `end_batch()` 并发 `Pages`。`pages()`/`journals()` 在索引未跟上时回落到 `catalog`（`pages()` 与索引求并集，索引优先；`journals()` 只读 `catalog`）。`rel_for_title` 的查找顺序是索引 → 日记格式 → `catalog` → `pages/<stem>.md` 兜底：**兜底路径会在索引未就绪时新建重复文件**，所以 `catalog` 这一层不能省。
+- **catalog 的失效**：`Created`/`Removed`（以及 rike 自己新建页面后的 `save_now`）只置 `catalog_dirty` 并唤醒 pump，300 ms 后一次 `list_pages()` 重建 `catalog` 再发 `Pages`。不要改成在事件里定点增删：`Created` 不是所有新文件都会发（`rescan_dir` 的 `announce_creation`），定点增删会漏。`scan()` 重建 `catalog` 时同时清 `catalog_dirty`。
+- **索引警告**：`Index::warnings()`（重复页面键、重复块 id）在 `emit_index_ver` 里经 `report_index_warnings` 变成通知，按消息去重（`Inner::warned`）。不要把它塞进每页的索引路径：扫描时那是 O(n log n) × 页数。
 - **事件**：`Rike.onEvent(cb)` 返回的 `Stop` 带注册 id，只撤销自己的注册。没有监听者时事件进积压并在下次注册时合并回放：积压有两层（`session.rs` 的 `backlog` 和 `api.rs` 的 `BACKLOG`），合并规则只有一份——`session.rs::coalesce`，`IndexVer`、`Pages` 各留一个，`PageChanged` 每页留最新，通知全留。加新事件种类时只改这一个函数。
 - **任务标记**只在 `rike_core::task` 里解析，`ops::toggle_todo`、`ops::set_task_done`、`md::render` 共用，不要再写第二份关键字列表。复选框是块文本的兄弟元素，点它不会进入编辑。NSH 的 `Checkbox` 没有自己的外观：必须给 `indicatorClass`/`indicator`，否则它不可见、测试也找不到 `id:task-checkbox`。取消勾选固定回 `TODO`。
 - **视图历史**（`store.ts`）：后退/前进栈上限 100；所有页面切换走 `navigate`，先结束编辑、关搜索，视图不同才入栈并清空前进栈；重载、冲突处理不写历史。`BackHandler.on("press")`（来自 `nsh/mobile`；Linux 上 Alt+←、Back 键、鼠标第 8 键）要在 `installShortcuts` 的 effect 外面注册。`Alt+→` 走 keymap。
@@ -213,5 +218,13 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
   - 根 `Cargo.toml` 里 `[profile.dev.package."*"] opt-level = 2`：dev 构建里的 Typst 太慢；代价是首次构建约 7 分钟。
 - **退出与切库**：见“界面与原生模块”（`Session::leave`，侧栏按钮 `id:quit` 和 `Ctrl+W`）。
 - **M2**：属性类型与 Class 模板（借鉴 Atomic Data 的概念，不嵌入 `atomic_lib`）、未链接引用、页面重命名、简单查询、vim 模态编辑（见下）、中文全文检索。
-- **M2 索引后端路线**（2026-11 评估 HawDB/DuckDB/Turso/seekdb 后定）：① 增量失效已落地：`Index::upsert_page/remove_page` 返回 `PageDelta`，session 累积成 `IndexChanges`（changed/removed rels + 被引用页键）随 `Event::IndexVer` 发给 TS，coalesce 按集合并集合并，TS 侧 backlinks 用 keys 脏检查、搜索用 ver；② 中文全文检索用 **tantivy + jieba** 直接接在 MemIndex 侧（spike 已验证：建 10k 块 93ms、单块增量 commit 53ms、查询全在亚毫秒级，结论见 `docs/spikes/tantivy-fts.md`）；③ 再用同一 `Index` 接缝 spike turso（纯 Rust、活跃，但 FTS 实验性）和 hawdb（同步 facade 默认可用、图+FTS 一体，但 v0.30、API 常变、单公司自用库）各一个最小实现，用同一基准（万页 upsert + 中文查询）定默认后端。DuckDB（OLAP 不匹配、CJK 弱）和 seekdb（无 Rust SDK、向量定位）排除。所有后端都只是可重建的派生缓存，Markdown 是唯一数据源。
+- **M2 索引后端路线**（2026-11 评估 HawDB/DuckDB/Turso/seekdb 后定）：① 增量失效已落地：`Index::upsert_page/remove_page` 返回 `PageDelta`，session 累积成 `IndexChanges`（changed/removed rels + 被引用页键）随 `Event::IndexVer` 发给 TS，coalesce 按集合并集合并，TS 侧 backlinks 用 keys 脏检查、搜索用 ver；② 中文全文检索已落地：tantivy + jieba 直接接在 MemIndex 侧（`fts.rs`，RAM 索引、jieba 全局单例、delete-by-rel 增量更新；索引用 `cut_for_search` 分词让组合词的部分可命中，token 检索与子串精准匹配取并集去重，按精准度分层：标题即查询（跳转目标）→ 原文连续命中 → jieba token 模糊命中（兑住词内部分/打字中途的召回）；spike 数据：建 10k 块 93ms、单块增量 53ms、查询亚毫秒，见 `docs/spikes/tantivy-fts.md`）；③ 再用同一 `Index` 接缝 spike turso（纯 Rust、活跃，但 FTS 实验性）和 hawdb（同步 facade 默认可用、图+FTS 一体，但 v0.30、API 常变、单公司自用库）各一个最小实现，用同一基准（万页 upsert + 中文查询）定默认后端。DuckDB（OLAP 不匹配、CJK 弱）和 seekdb（无 Rust SDK、向量定位）排除。所有后端都只是可重建的派生缓存，Markdown 是唯一数据源。
 - **M3**：OpenDAL 远端同步（webdav/s3、三方合并、tombstone）；RichEditor 实验（工程已删除，结论在 `docs/spikes/rich-editor.md`）是：：`[[x]]` 往返会被转义，要先给 schema 加 `pageRef`/`tag`/`blockRef` 节点才能考虑换编辑器。
+
+## 立场审查（stance review）
+
+改动碰到启动路径、索引与缓存、状态归属、写盘路径、里程碑边界或路线图时，用
+`.agents/skills/rike-stance-registry` 查哪几个 stance 拥有这个问题、哪几对互相
+对立，再按 `hydra-crux-review` 的方式给每一侧各派一个 reviewer（reviewer 只读
+自己的 stance 文件，不读账本）。立场地图在 `docs/stances.md`；新增或修改立场先
+改地图，再改 stance 文件。

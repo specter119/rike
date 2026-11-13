@@ -31,10 +31,12 @@ rike-native = { path = "crates/rike-native" }
 
 blake3 = "1"
 env_logger = { version = "0.11", default-features = false }
+jieba-rs = "0.11"
 log = "0.4"
 notify-debouncer-full = "0.7"
 opendal = { version = "=0.59.5", default-features = false, features = ["services-fs", "executors-tokio"] }
 proptest = "1"
+tantivy = "0.27"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }

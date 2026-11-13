@@ -10,7 +10,7 @@
 //! in tests).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use rike_core::config::{VaultConfig, parse_config_edn};
 use rike_core::journal::JournalDate;
-use rike_core::names::{PageKey, title_to_file_stem};
+use rike_core::names::{PageKey, file_stem_to_title, title_to_file_stem};
 use rike_core::ops;
 use rike_core::parse::parse_page;
 use rike_core::serialize::serialize_page;
@@ -30,9 +30,10 @@ use rike_core::task::Marker;
 use rike_core::{Block, BlockId, Page};
 use rike_index::resolve_title;
 use rike_index::{
-    BacklinkGroup, BlockInfo, Index, IndexChanges, MemIndex, PageEntry, PageSource, SearchHit,
+    BacklinkGroup, BlockInfo, Index, IndexChanges, IndexWarning, MemIndex, PageEntry, PageSource,
+    SearchHit,
 };
-use rike_vault::{SaveOutcome, Vault, VaultError, VaultEvent, VaultHandle};
+use rike_vault::{PageFile, SaveOutcome, Vault, VaultError, VaultEvent, VaultHandle};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Instant, Sleep};
@@ -68,6 +69,13 @@ pub enum Event {
     IndexVer { ver: u64, changes: IndexChanges },
     /// The page list changed (a file appeared or disappeared).
     Pages,
+    /// The background index moved: `done` of `total` pages parsed. The UI can
+    /// draw the vault from the catalog meanwhile.
+    IndexProgress {
+        done: usize,
+        total: usize,
+        indexing: bool,
+    },
 }
 
 /// Where events go. The api layer wraps a TS callback in one of these.
@@ -489,6 +497,11 @@ enum PumpMsg {
     SaveDebounced(String),
     CancelSaves,
     IndexDirty,
+    /// The vault listing may have changed (a file appeared or disappeared):
+    /// re-list after the debounce and refresh the catalog.
+    CatalogDirty,
+    /// Pages were queued for the background index: wake the pump so it starts.
+    IndexQueued,
     Shutdown,
 }
 
@@ -517,6 +530,17 @@ struct Inner {
     today: JournalDate,
     config: VaultConfig,
     index: MemIndex,
+    /// The listing, taken before any page is parsed: what the sidebar and the
+    /// journal stream show while the index is still loading.
+    catalog: Vec<PageEntry>,
+    /// Pages the background index still has to parse.
+    pending_index: VecDeque<String>,
+    /// How many pages the current index run covers.
+    index_total: usize,
+    /// A background index run is in progress.
+    indexing: bool,
+    /// The listing changed since the last catalog refresh.
+    catalog_dirty: bool,
     docs: HashMap<String, PageState>,
     editing: Option<Edit>,
     undo: Vec<(String, Page)>,
@@ -528,6 +552,8 @@ struct Inner {
     leaving: bool,
     index_ver: u64,
     index_changes: IndexChanges,
+    /// Index warnings already shown, so a rescan does not repeat them.
+    warned: HashSet<String>,
     sink: Option<EventSink>,
     /// Events coalesced while no sink is registered; replayed on registration.
     backlog: Vec<Event>,
@@ -559,6 +585,11 @@ impl Session {
                 today,
                 config: VaultConfig::default(),
                 index: MemIndex::new(),
+                catalog: Vec::new(),
+                pending_index: VecDeque::new(),
+                index_total: 0,
+                indexing: false,
+                catalog_dirty: false,
                 docs: HashMap::new(),
                 editing: None,
                 undo: Vec::new(),
@@ -569,6 +600,7 @@ impl Session {
                 leaving: false,
                 index_ver: 0,
                 index_changes: IndexChanges::default(),
+                warned: HashSet::new(),
                 sink: None,
                 backlog: Vec::new(),
                 pump_tx,
@@ -623,7 +655,83 @@ impl Session {
             Ok(None) => {}
             Err(e) => self.notify("", format!("读取 config.edn 失败：{e}"), NoticeKind::Error),
         }
-        self.scan().await;
+        self.queue_index().await;
+    }
+
+    /// Lists the vault, fills the catalog the UI draws before anything is
+    /// parsed, and queues every page for the background index. Returns at once:
+    /// the pump parses the pages between other work.
+    async fn queue_index(&self) {
+        let files = match self.vault().list_pages().await {
+            Ok(files) => files,
+            Err(e) => {
+                self.notify("", format!("列出页面失败：{e}"), NoticeKind::Error);
+                return;
+            }
+        };
+        let total = files.len();
+        let pending: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+        {
+            let mut i = self.inner.borrow_mut();
+            i.catalog = catalog_of(&i.config, &files);
+            i.pending_index = pending.into();
+            i.index_total = total;
+            i.indexing = total > 0;
+            // An empty vault has nothing to batch, and a batch left open would
+            // keep every later edit out of the search index: `end_batch` is
+            // only reached when the queue drains.
+            if total > 0 {
+                i.index.begin_batch();
+            }
+        }
+        self.emit(Event::IndexProgress {
+            done: 0,
+            total,
+            indexing: total > 0,
+        });
+        self.send(PumpMsg::IndexQueued);
+    }
+
+    /// Parses one queued page, reports progress, and closes the batch on the
+    /// last one. Driven by the pump, so an edit never races the scan.
+    async fn index_next(&self) {
+        let Some(rel) = self.inner.borrow_mut().pending_index.pop_front() else {
+            return;
+        };
+        if !self.inner.borrow().docs.contains_key(&rel) {
+            self.index_from_disk(&rel, false).await;
+        }
+        let (done, total) = {
+            let i = self.inner.borrow();
+            (
+                i.index_total.saturating_sub(i.pending_index.len()),
+                i.index_total,
+            )
+        };
+        if done % 8 == 0 || done == total {
+            self.emit(Event::IndexProgress {
+                done,
+                total,
+                indexing: done < total,
+            });
+        }
+        // Keep search usable during a long scan: the batch commits in chunks.
+        if done % 32 == 0 {
+            self.inner.borrow_mut().index.commit();
+        }
+        if done == total {
+            {
+                let mut i = self.inner.borrow_mut();
+                i.index.end_batch();
+                i.indexing = false;
+            }
+            self.emit(Event::IndexProgress {
+                done,
+                total,
+                indexing: false,
+            });
+            self.emit(Event::Pages);
+        }
     }
 
     /// Stops the pump; the host calls this before dropping a session it
@@ -690,11 +798,15 @@ impl Session {
                         }
                         PumpMsg::CancelSaves => deadlines.clear(),
                         PumpMsg::Shutdown => break,
-                        PumpMsg::IndexDirty => {
+                        PumpMsg::IndexDirty | PumpMsg::CatalogDirty => {
                             if index_timer.is_none() {
                                 index_timer = Some(Box::pin(tokio::time::sleep(INDEX_DELAY)));
                             }
                         }
+                        // The queue is read by the branch below; this only
+                        // wakes the pump, which would otherwise sleep until
+                        // something else happens.
+                        PumpMsg::IndexQueued => {}
                     }
                     rearm_save_timer(&mut save_timer, &deadlines);
                 }
@@ -723,7 +835,13 @@ impl Session {
                 } => {
                     index_timer = None;
                     self.emit_index_ver();
+                    self.refresh_catalog().await;
                 }
+                () = async {
+                    if self.inner.borrow().pending_index.is_empty() {
+                        std::future::pending::<()>().await;
+                    }
+                } => self.index_next().await,
             }
         }
     }
@@ -757,6 +875,25 @@ impl Session {
             }
         };
         self.emit(event);
+        self.report_index_warnings();
+    }
+
+    /// Surfaces index warnings the user has not seen yet. A duplicate page key
+    /// means a link may resolve to a different file than the user expects, so
+    /// it cannot stay inside the index.
+    fn report_index_warnings(&self) {
+        let warnings = self.inner.borrow().index.warnings();
+        let fresh: Vec<String> = {
+            let mut i = self.inner.borrow_mut();
+            warnings
+                .into_iter()
+                .map(warning_message)
+                .filter(|message| i.warned.insert(message.clone()))
+                .collect()
+        };
+        for message in fresh {
+            self.notify("", message, NoticeKind::Info);
+        }
     }
 
     /// Pushes a notice, replacing an unanswered one of the same page and kind.
@@ -1424,15 +1561,23 @@ impl Session {
         }
         match self.vault().save(rel, content.clone()).await {
             Ok(SaveOutcome::Saved { .. }) => {
-                let mut i = self.inner.borrow_mut();
-                if let Some(ps) = i.docs.get_mut(rel) {
-                    let current = serialize_page(&ps.doc.page);
-                    if !ps.doc.exists || current == content {
-                        ps.doc.exists = true;
-                        if current == content {
-                            ps.doc.dirty = false;
+                {
+                    let mut i = self.inner.borrow_mut();
+                    if let Some(ps) = i.docs.get_mut(rel) {
+                        let current = serialize_page(&ps.doc.page);
+                        if !ps.doc.exists || current == content {
+                            ps.doc.exists = true;
+                            if current == content {
+                                ps.doc.dirty = false;
+                            }
                         }
                     }
+                }
+                // A page rike created itself never produces a watcher event
+                // (self-writes are recognised), so the listing has to be told.
+                if !exists {
+                    self.catalog_changed();
+                    self.emit(Event::Pages);
                 }
                 true
             }
@@ -1589,14 +1734,18 @@ impl Session {
                 title: i.config.journal.format_title(i.today),
                 date: Some(i.today),
             }];
-            for entry in i.index.journals() {
-                if entry.rel_path != today_rel && entry.journal.is_some_and(|d| d < i.today) {
-                    entries.push(JournalEntry {
-                        rel: entry.rel_path,
-                        title: entry.title,
-                        date: entry.journal,
-                    });
-                }
+            let mut older: Vec<&PageEntry> = i
+                .catalog
+                .iter()
+                .filter(|e| e.rel_path != today_rel && e.journal.is_some_and(|d| d < i.today))
+                .collect();
+            older.sort_by_key(|a| std::cmp::Reverse(a.journal));
+            for entry in older {
+                entries.push(JournalEntry {
+                    rel: entry.rel_path.clone(),
+                    title: entry.title.clone(),
+                    date: entry.journal,
+                });
             }
             entries
         };
@@ -1672,25 +1821,53 @@ impl Session {
     }
 
     /// Non-journal pages by title, for the sidebar.
+    /// Whether the background index is still parsing pages.
+    pub fn indexing(&self) -> bool {
+        self.inner.borrow().indexing
+    }
+
+    /// Every page the vault has: what the index parsed, plus what the catalog
+    /// listed and the background index has not reached yet.
     pub fn pages(&self) -> Vec<PageEntry> {
-        self.inner
-            .borrow()
+        let i = self.inner.borrow();
+        let mut pages: Vec<PageEntry> = i
             .index
             .pages()
             .into_iter()
             .filter(|p| p.journal.is_none())
-            .collect()
+            .collect();
+        let known: HashSet<String> = pages.iter().map(|p| p.rel_path.clone()).collect();
+        for entry in &i.catalog {
+            if entry.journal.is_none() && !known.contains(&entry.rel_path) {
+                pages.push(entry.clone());
+            }
+        }
+        pages.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        pages
     }
 
     /// The vault-relative path of a page title, following the journal format.
     pub fn rel_for_title(&self, title: &str) -> String {
         let i = self.inner.borrow();
         let title = title.trim();
-        if let Some(entry) = i.index.page(&PageKey::new(title)) {
+        let key = PageKey::new(title);
+        if let Some(entry) = i.index.page(&key) {
             return entry.rel_path;
         }
         if let Some(date) = i.config.journal.parse_title(title) {
             return format!("journals/{}.md", i.config.journal.format_file_stem(date));
+        }
+        // The background index may not have reached this page yet. The catalog
+        // was taken from the listing before any parsing, so it already knows
+        // which file owns the title; without it, a link followed during the
+        // scan would create a second file for a page that already exists.
+        if let Some(entry) = i.catalog.iter().find(|e| e.key == key) {
+            return entry.rel_path.clone();
         }
         format!("pages/{}.md", title_to_file_stem(title))
     }
@@ -1718,7 +1895,7 @@ impl Session {
                         None => false,
                     }
                 };
-                self.emit(Event::Pages);
+                self.catalog_changed();
                 if loaded {
                     self.notify(&rel, format!("{rel} 已在磁盘上被删除"), NoticeKind::Info);
                 }
@@ -1726,6 +1903,7 @@ impl Session {
             }
             VaultEvent::Created { rel } => {
                 let loaded = self.inner.borrow().docs.contains_key(&rel);
+                self.catalog_changed();
                 if loaded {
                     Vec::new()
                 } else {
@@ -1750,10 +1928,14 @@ impl Session {
         match busy {
             None => {
                 // Nobody shows the page: just keep the index honest.
-                let mut i = self.inner.borrow_mut();
-                let parsed = parse_page(content);
-                index_parsed(&mut i, rel, &parsed.page);
-                drop(i);
+                let stale = {
+                    let mut i = self.inner.borrow_mut();
+                    let parsed = parse_page(content);
+                    index_parsed(&mut i, rel, &parsed.page)
+                };
+                if stale {
+                    self.emit(Event::Pages);
+                }
                 Vec::new()
             }
             Some(true) => {
@@ -1789,12 +1971,12 @@ impl Session {
     /// Replaces the page with the parsed `content`, bumps `gen` and forgets
     /// the page's editing state and undo history. Returns the read-only flag.
     fn reload(&self, rel: &str, content: &str) -> bool {
-        let (read_only, r#gen) = {
+        let (read_only, r#gen, stale) = {
             let mut i = self.inner.borrow_mut();
             let parsed = parse_page(content);
             let (title, journal) = resolve_title(rel, &parsed.page, &i.config);
             let read_only = !parsed.lossless;
-            index_parsed(&mut i, rel, &parsed.page);
+            let stale = index_parsed(&mut i, rel, &parsed.page);
             if i.editing.as_ref().is_some_and(|e| e.rel == rel) {
                 i.editing = None;
             }
@@ -1812,17 +1994,22 @@ impl Session {
                     1
                 }
             };
-            (read_only, r#gen)
+            (read_only, r#gen, stale)
         };
         self.emit(Event::PageChanged {
             rel: rel.to_owned(),
             r#gen,
         });
+        if stale {
+            self.emit(Event::Pages);
+        }
         read_only
     }
 
     // ---- indexing ---------------------------------------------------------
 
+    /// Re-lists the vault after files appeared or disappeared: the catalog
+    /// follows the listing, and the new pages join the background index.
     async fn scan(&self) {
         let files = match self.vault().list_pages().await {
             Ok(files) => files,
@@ -1831,25 +2018,79 @@ impl Session {
                 return;
             }
         };
-        for file in files {
-            if !self.inner.borrow().docs.contains_key(&file.rel) {
-                self.index_from_disk(&file.rel, false).await;
-            }
+        let pending: Vec<String> = {
+            let i = self.inner.borrow();
+            files
+                .iter()
+                .filter(|f| !i.docs.contains_key(&f.rel) && !i.pending_index.contains(&f.rel))
+                .map(|f| f.rel.clone())
+                .collect()
+        };
+        {
+            let mut i = self.inner.borrow_mut();
+            i.catalog = catalog_of(&i.config, &files);
+            i.catalog_dirty = false;
         }
-        self.emit(Event::Pages);
+        if pending.is_empty() {
+            self.emit(Event::Pages);
+            return;
+        }
+        let (done, total) = {
+            let mut i = self.inner.borrow_mut();
+            i.pending_index.extend(pending);
+            i.index_total = i.pending_index.len();
+            i.indexing = true;
+            i.index.begin_batch();
+            (
+                i.index_total.saturating_sub(i.pending_index.len()),
+                i.index_total,
+            )
+        };
+        self.emit(Event::IndexProgress {
+            done,
+            total,
+            indexing: true,
+        });
+        self.send(PumpMsg::IndexQueued);
     }
 
     async fn index_from_disk(&self, rel: &str, announce: bool) {
         if let Ok(loaded) = self.vault().load(rel).await {
-            {
+            let stale = {
                 let mut i = self.inner.borrow_mut();
                 let parsed = parse_page(&loaded.content);
-                index_parsed(&mut i, rel, &parsed.page);
-            }
-            if announce {
+                index_parsed(&mut i, rel, &parsed.page)
+            };
+            if announce || stale {
                 self.emit(Event::Pages);
             }
         }
+    }
+
+    /// Re-lists the vault after files appeared or disappeared and republishes
+    /// the page list. Debounced by the pump, so a bulk import costs one
+    /// listing instead of one per file.
+    async fn refresh_catalog(&self) {
+        if !std::mem::take(&mut self.inner.borrow_mut().catalog_dirty) {
+            return;
+        }
+        let files = match self.vault().list_pages().await {
+            Ok(files) => files,
+            // Keep the last known listing rather than emptying the sidebar.
+            Err(_) => return,
+        };
+        {
+            let mut i = self.inner.borrow_mut();
+            i.catalog = catalog_of(&i.config, &files);
+        }
+        self.emit(Event::Pages);
+    }
+
+    /// Marks the listing as changed and wakes the pump to re-list after the
+    /// debounce.
+    fn catalog_changed(&self) {
+        self.inner.borrow_mut().catalog_dirty = true;
+        self.send(PumpMsg::CatalogDirty);
     }
 
     // ---- small helpers ----------------------------------------------------
@@ -2093,14 +2334,18 @@ pub(crate) fn coalesce(backlog: &mut Vec<Event>, event: Event) {
             return;
         }
         Event::Pages => backlog.retain(|e| !matches!(e, Event::Pages)),
+        // Only the latest progress matters.
+        Event::IndexProgress { .. } => {
+            backlog.retain(|e| !matches!(e, Event::IndexProgress { .. }));
+        }
         Event::Notice(_) => {}
     }
     backlog.push(event);
 }
 
-fn index_page(i: &mut Inner, rel: &str) {
+fn index_page(i: &mut Inner, rel: &str) -> bool {
     let Some(ps) = i.docs.get(rel) else {
-        return;
+        return false;
     };
     let delta = i.index.upsert_page(PageSource {
         rel_path: rel,
@@ -2109,9 +2354,55 @@ fn index_page(i: &mut Inner, rel: &str) {
     });
     i.index_changes.record_upsert(rel, delta);
     let _ = i.pump_tx.send(PumpMsg::IndexDirty);
+    catalog_disagrees(i, rel)
 }
 
-fn index_parsed(i: &mut Inner, rel: &str, page: &Page) {
+/// True when the parsed page no longer agrees with the catalog's listing of
+/// it (a `title::` property, a journal date), so the page list has to be
+/// republished. Derived from the file name instead of searching the catalog,
+/// so the scan stays linear.
+fn catalog_disagrees(i: &Inner, rel: &str) -> bool {
+    let Some(parsed) = i.index.page_by_path(rel) else {
+        return false;
+    };
+    let listed = catalog_entry(&i.config, rel);
+    parsed.title != listed.title || parsed.journal != listed.journal
+}
+
+/// The page listing without parsing anything: titles come from the file names
+/// (and the journal format), which is what the UI needs before the index is
+/// ready.
+fn catalog_of(config: &VaultConfig, files: &[PageFile]) -> Vec<PageEntry> {
+    files
+        .iter()
+        .map(|file| catalog_entry(config, &file.rel))
+        .collect()
+}
+
+/// What the listing alone says about `rel`: title from the file name (or the
+/// journal format), no file read. Used both to build the catalog and to check
+/// whether parsing found something the listing could not know.
+fn catalog_entry(config: &VaultConfig, rel: &str) -> PageEntry {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = name.strip_suffix(".md").unwrap_or(name);
+    let journal = if rel.starts_with("journals/") {
+        config.journal.parse_file_stem(stem)
+    } else {
+        None
+    };
+    let title = match journal {
+        Some(date) => config.journal.format_title(date),
+        None => file_stem_to_title(stem),
+    };
+    PageEntry {
+        key: PageKey::new(&title),
+        title,
+        rel_path: rel.to_owned(),
+        journal,
+    }
+}
+
+fn index_parsed(i: &mut Inner, rel: &str, page: &Page) -> bool {
     let delta = i.index.upsert_page(PageSource {
         rel_path: rel,
         page,
@@ -2119,6 +2410,25 @@ fn index_parsed(i: &mut Inner, rel: &str, page: &Page) {
     });
     i.index_changes.record_upsert(rel, delta);
     let _ = i.pump_tx.send(PumpMsg::IndexDirty);
+    catalog_disagrees(i, rel)
+}
+
+/// A user-facing sentence for an index warning. A duplicate page key means a
+/// link may resolve to a file the user did not mean, so it has to leave the
+/// index.
+fn warning_message(warning: IndexWarning) -> String {
+    match warning {
+        IndexWarning::DuplicatePageKey { key, rel_paths } => format!(
+            "页面名「{}」被多个文件使用：{}。rike 不合并它们，链接只会指向其中一个。",
+            key.as_str(),
+            rel_paths.join("、")
+        ),
+        IndexWarning::DuplicateBlockId { id, rel_paths } => format!(
+            "块 id {} 被多个页面使用：{}。只有第一个生效。",
+            id.0,
+            rel_paths.join("、")
+        ),
+    }
 }
 
 fn push_undo(i: &mut Inner, rel: &str, before: Page) {

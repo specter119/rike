@@ -1,15 +1,18 @@
-import { Text, View } from "nsh";
-import { Button } from "nsh/base";
+import { Text, token, View } from "nsh";
 import type { NoticeDto } from "rike";
 import { Backlinks } from "./backlinks";
 import { Block } from "./block";
 import { Btn } from "./widgets";
-import { acceptDisk, keepMine, navigate, pageOf } from "./store";
+import { acceptDisk, keepMine, pageOf } from "./store";
 
 function Banner(props: { rel: string; notice: () => NoticeDto }) {
   const external = () => props.notice().kind === "external";
   return (
-    <View testID="notice" class="bg-muted" style={{ width: "100%", flexDirection: "row", alignItems: "center", gap: 8, padding: 8 }}>
+    <View
+      testID="notice"
+      class="rounded-md border border-border bg-muted"
+      style={{ width: "100%", flexDirection: "row", alignItems: "center", gap: 8, padding: 8, marginBottom: 8 }}
+    >
       <View style={{ flex: 1 }}>
         <Text style={{ fontSize: 12 }}>{props.notice().message}</Text>
       </View>
@@ -19,40 +22,37 @@ function Banner(props: { rel: string; notice: () => NoticeDto }) {
   );
 }
 
-/** A page: title, blocks and, for a page view, its backlinks. */
-export function DocView(props: { rel: string; linkTitle: boolean; withBacklinks: boolean }) {
+/** The outline of a page: its banner and its blocks. */
+export function DocBody(props: { rel: string }) {
   const page = pageOf(props.rel);
   const readOnly = () => page()?.readOnly ?? false;
   return (
-    <View style={{ flexDirection: "column", gap: 4 }}>
-      <Button
-        onPress={() => {
-          if (props.linkTitle) navigate({ kind: "page", rel: props.rel });
-        }}
-        style={{ flexDirection: "row", gap: 8, alignItems: "center" }}
-      >
-        <Text testID="doc-title" style={{ fontSize: 22, fontWeight: "600" }}>
-          {page()?.title ?? ""}
-        </Text>
-        <If when={readOnly()}>
-          <Text class="text-muted-foreground" style={{ fontSize: 11 }}>
-            只读
-          </Text>
-        </If>
-      </Button>
-      <If when={props.linkTitle}>
-        <Text testID="doc-path" class="text-muted-foreground" style={{ fontSize: 11 }}>
-          {page()?.rel ?? ""}
-        </Text>
-      </If>
+    <View style={{ flexDirection: "column" }}>
       <If when={page()?.notice}>{(n) => <Banner rel={props.rel} notice={n} />}</If>
       <Each of={page()?.rows ?? []} key={(r) => r.id}>
         {(row) => <Block rel={props.rel} row={row} readOnly={readOnly} />}
       </Each>
-      <If when={props.withBacklinks}>
-        <Backlinks rel={props.rel} />
-      </If>
     </View>
   );
 }
 
+/** A page opened on its own: where it lives, its outline, and who links here. */
+export function DocPage(props: { rel: string }) {
+  const page = pageOf(props.rel);
+  return (
+    <View style={{ flexDirection: "column" }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <Text testID="doc-path" class="text-muted-foreground" style={{ fontSize: 11, fontFamily: token("font-mono") }}>
+          {page()?.rel ?? ""}
+        </Text>
+        <If when={page()?.readOnly}>
+          <Text class="text-muted-foreground" style={{ fontSize: 11 }}>
+            只读
+          </Text>
+        </If>
+      </View>
+      <DocBody rel={props.rel} />
+      <Backlinks rel={props.rel} />
+    </View>
+  );
+}

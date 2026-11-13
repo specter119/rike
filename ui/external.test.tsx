@@ -35,11 +35,11 @@ test("quit is refused while a page waits for the user to pick a side", async () 
   await app.type("id:block-input", "mine");
   Rike.devWrite(TODAY, "- theirs\n");
   await app.waitFor("text:载入外部版本", { timeout: 10000 });
-  await app.press("id:quit");
+  await app.press("id:window-close");
   await app.wait(600);
   expect(file(TODAY)).toBe("- theirs\n");
   expect(app.shows("text:载入外部版本")).toBe(true);
-  await app.press("id:quit");
+  await app.press("id:window-close");
   await app.wait(300);
   expect(file(TODAY)).toBe("- theirs\n");
 });

@@ -3,5 +3,6 @@
   "id": "dev.rike.app",
   "version": "0.1.0",
   "build": 1,
+  "theme": "theme.json",
   "rust": "../crates/rike-native"
 }

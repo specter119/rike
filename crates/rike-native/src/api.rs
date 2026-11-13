@@ -227,7 +227,7 @@ pub struct LeaveResultDto {
 /// Something the UI should react to.
 #[derive(Debug, Clone, JsObject)]
 pub struct EventDto {
-    /// `"page"`, `"notice"`, `"index"` or `"pages"`.
+    /// `"page"`, `"notice"`, `"index"`, `"pages"` or `"indexProgress"`.
     pub kind: String,
     pub rel: Option<String>,
     pub generation: Option<u64>,
@@ -239,6 +239,11 @@ pub struct EventDto {
     pub removed: Vec<String>,
     /// `kind == "index"`: page keys whose backlink groups changed.
     pub backlink_keys: Vec<String>,
+    /// `kind == "indexProgress"`: pages parsed, pages to parse, and whether
+    /// the background index is still running.
+    pub done: Option<u32>,
+    pub total: Option<u32>,
+    pub indexing: Option<bool>,
 }
 
 // ---- conversions -----------------------------------------------------------
@@ -444,6 +449,9 @@ fn event_dto(event: &Event) -> EventDto {
         changed: Vec::new(),
         removed: Vec::new(),
         backlink_keys: Vec::new(),
+        done: None,
+        total: None,
+        indexing: None,
     };
     match event {
         Event::PageChanged { rel, r#gen } => EventDto {
@@ -455,6 +463,17 @@ fn event_dto(event: &Event) -> EventDto {
         Event::Notice(notice) => EventDto {
             kind: "notice".into(),
             notice: Some(notice_dto(notice.clone())),
+            ..empty
+        },
+        Event::IndexProgress {
+            done,
+            total,
+            indexing,
+        } => EventDto {
+            kind: "indexProgress".into(),
+            done: Some(*done as u32),
+            total: Some(*total as u32),
+            indexing: Some(*indexing),
             ..empty
         },
         Event::IndexVer { ver, changes } => EventDto {

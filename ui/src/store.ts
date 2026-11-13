@@ -57,6 +57,12 @@ const indexVerS = signal(0);
 /** Page keys whose backlink groups changed in the last index event. */
 const indexBacklinkKeysS = signal<readonly string[]>([]);
 const toastsS = signal<NoticeDto[]>([]);
+/** The background index: how far it got, and whether it is still running. */
+const indexProgressS = signal<{ done: number; total: number; indexing: boolean }>({
+	done: 0,
+	total: 0,
+	indexing: false,
+});
 let localToastId = 0;
 
 const searchOpenS = signal(false);
@@ -109,6 +115,17 @@ export const canForward: () => boolean = canForwardS;
 export const sidebarPages: () => PageEntryDto[] = sidebarPagesS;
 export const indexVer: () => number = indexVerS;
 export const toasts: () => NoticeDto[] = toastsS;
+
+/** Whether the background index is still parsing pages. */
+export function indexing(): boolean {
+	return indexProgressS().indexing;
+}
+
+/** Parsed and total pages of the background index. */
+export function indexProgress(): { done: number; total: number } {
+	const p = indexProgressS();
+	return { done: p.done, total: p.total };
+}
 export const searchOpen: () => boolean = searchOpenS;
 export const quitting: () => boolean = quittingS;
 export const leaveNotice: () => string | null = leaveNoticeS;
@@ -253,6 +270,13 @@ function onEvent(ev: EventDto): void {
 		case "pages":
 			refreshPages();
 			void loadJournals();
+			break;
+		case "indexProgress":
+			indexProgressS.set({
+				done: ev.done ?? 0,
+				total: ev.total ?? 0,
+				indexing: ev.indexing ?? false,
+			});
 			break;
 	}
 }

@@ -3,6 +3,7 @@
 //! Everything here can be recomputed from the Markdown files. The [`Index`]
 //! trait keeps the storage replaceable (an in-memory map now, HawDB later).
 
+mod fts;
 mod mem;
 mod title;
 
@@ -145,6 +146,14 @@ pub trait Index {
     fn upsert_page(&mut self, source: PageSource<'_>) -> PageDelta;
     /// Removes `rel_path` and reports what the removal invalidated.
     fn remove_page(&mut self, rel_path: &str) -> PageDelta;
+
+    /// Starts a bulk load: a backend that pays for each commit may defer them
+    /// to `commit`. Nothing written during a batch is searchable until then.
+    fn begin_batch(&mut self) {}
+    /// Commits what the batch wrote so far, and keeps deferring new writes.
+    fn commit(&mut self) {}
+    /// Ends a bulk load: commits, then writes commit as they come again.
+    fn end_batch(&mut self) {}
 
     /// All pages sorted by title (case-insensitive).
     fn pages(&self) -> Vec<PageEntry>;

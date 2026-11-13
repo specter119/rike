@@ -1,7 +1,8 @@
-import { computed, signal, Text, View } from "nsh";
+import { computed, signal, Text, token, View } from "nsh";
 import { Button, Input } from "nsh/base";
 import { Rike } from "rike";
 import type { SearchHitDto } from "rike";
+import { pageLabel } from "./dates";
 import { closeSearch, indexVer, navigate, searchOpen, setComposing } from "./store";
 
 function open(hit: SearchHitDto): void {
@@ -9,8 +10,9 @@ function open(hit: SearchHitDto): void {
 }
 
 function label(hit: SearchHitDto): string {
-  if (hit.kind === "page") return `📄 ${hit.title}`;
-  return `${hit.title} — ${(hit.text ?? "").split("\n")[0]}`;
+  const page = pageLabel(hit.rel, hit.title);
+  if (hit.kind === "page") return page;
+  return `${page} — ${(hit.text ?? "").split("\n")[0]}`;
 }
 
 function SearchPanel() {
@@ -25,7 +27,11 @@ function SearchPanel() {
     }
   });
   return (
-    <View testID="search" class="border-b border-border bg-muted" style={{ flexDirection: "column", gap: 4, padding: 8 }}>
+    <View
+      testID="search"
+      class="border-b border-border bg-card"
+      style={{ flexDirection: "column", gap: 2, paddingHorizontal: 32, paddingTop: 12, paddingBottom: 12 }}
+    >
       <Input
         testID="search-input"
         placeholder="搜索页面和块…"
@@ -40,11 +46,21 @@ function SearchPanel() {
       />
       <Each of={hits()} key={(h) => h.n}>
         {(h) => (
-          <Button testID="search-hit" onPress={() => open(h().hit)} class="rounded" style={{ paddingHorizontal: 8, paddingVertical: 4 }}>
+          <Button
+            testID="search-hit"
+            onPress={() => open(h().hit)}
+            class="rounded-md hover:bg-muted"
+            style={{ paddingHorizontal: 8, paddingVertical: 4 }}
+          >
             <Text style={{ fontSize: 13 }}>{label(h().hit)}</Text>
           </Button>
         )}
       </Each>
+      <If when={hits().length === 0}>
+        <Text class="text-muted-foreground" style={{ fontSize: 11, paddingHorizontal: 8, paddingTop: 2, fontFamily: token("font-mono") }}>
+          Ctrl K 打开，Esc 关闭
+        </Text>
+      </If>
     </View>
   );
 }

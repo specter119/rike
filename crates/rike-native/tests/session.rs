@@ -100,6 +100,10 @@ async fn start(setup: impl FnOnce(&Path), debounce: Duration, hooks: Hooks) -> F
     session.set_event_sink(Some(sink));
     let pump = tokio::task::spawn_local(session.clone().pump());
     session.start().await;
+    // `start` returns once the catalog is up; the pump parses the pages.
+    while session.indexing() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     Fixture {
         dir,
         session,
@@ -880,6 +884,191 @@ fn the_basic_fixture_indexes_pages_and_resolves_refs() {
         assert!(code.is_some(), "{:?}", view.rows);
         let hits = s.search("meeting");
         assert!(!hits.is_empty());
+        f.pump.abort();
+    });
+}
+
+// ---- catalog and the background index -------------------------------------
+
+#[test]
+fn an_empty_vault_indexes_pages_written_after_start() {
+    run(async {
+        // No file exists when the session starts, so the scan queues nothing.
+        // The full-text index must not be left in batch mode: an open batch is
+        // only closed when the queue drains, and an empty queue never drains.
+        let f = start(|_| {}, FAST, Hooks::default()).await;
+        let s = &f.session;
+        let rel = today_rel();
+        let view = s.page(&rel).await.unwrap();
+        let id = view.rows[0].id;
+        assert!(s.set_draft(&rel, view.r#gen, id, "zebra and horse"));
+        assert!(s.save_now(&rel).await);
+        // A reordered query is not a substring of the block, so only the
+        // full-text index can answer it: this fails when the batch stayed open.
+        assert!(
+            !s.search("horse zebra").is_empty(),
+            "a page written after an empty start must be searchable"
+        );
+        f.pump.abort();
+    });
+}
+
+#[test]
+fn a_link_followed_before_the_index_finishes_resolves_through_the_catalog() {
+    run(async {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("pages/sub")).unwrap();
+        std::fs::write(dir.path().join("pages/sub/Already Here.md"), "- body\n").unwrap();
+        let (vault, events) = Vault::open_with(dir.path(), VaultOptions::new().with_debounce(FAST))
+            .await
+            .unwrap();
+        // No pump: the index stays empty, which is the window a link is
+        // followed in right after the window appears.
+        let session = Session::new(
+            vault,
+            Arc::new(tokio::sync::Mutex::new(events)),
+            today(),
+            Handle::current(),
+            Hooks::default(),
+        );
+        session.start().await;
+        assert!(session.indexing(), "the index must still be pending");
+        assert_eq!(
+            session.rel_for_title("Already Here"),
+            "pages/sub/Already Here.md",
+            "the catalog already knows the file; guessing a path would create a second one"
+        );
+    });
+}
+
+#[test]
+fn a_journal_created_on_disk_reaches_the_journal_list() {
+    run(async {
+        let f = start(
+            |dir| {
+                std::fs::create_dir_all(dir.join("journals")).unwrap();
+            },
+            FAST,
+            Hooks::default(),
+        )
+        .await;
+        let s = &f.session;
+        let rel = "journals/2026_10_31.md";
+        // The journal stream reads the catalog, not the index, so this is the
+        // surface a stale catalog breaks.
+        assert!(!s.journals(7).await.entries.iter().any(|e| e.rel == rel));
+
+        std::fs::write(f.file(rel), "- yesterday\n").unwrap();
+        let started = Instant::now();
+        while !s.journals(7).await.entries.iter().any(|e| e.rel == rel) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "timed out waiting for the new journal"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        f.pump.abort();
+    });
+}
+
+#[test]
+fn a_page_removed_on_disk_leaves_the_catalog() {
+    run(async {
+        let f = start(
+            |dir| {
+                std::fs::create_dir_all(dir.join("pages")).unwrap();
+                std::fs::write(dir.join("pages/Gone.md"), "- gone\n").unwrap();
+            },
+            FAST,
+            Hooks::default(),
+        )
+        .await;
+        let s = &f.session;
+        assert!(s.pages().iter().any(|p| p.title == "Gone"));
+
+        std::fs::remove_file(f.file("pages/Gone.md")).unwrap();
+        until("the deleted page to leave the catalog", || {
+            !s.pages().iter().any(|p| p.title == "Gone")
+        })
+        .await;
+        f.pump.abort();
+    });
+}
+
+#[test]
+fn a_page_saved_by_rike_reaches_the_page_list() {
+    run(async {
+        // rike's own writes are recognised as self-writes, so no watcher event
+        // announces them: the save path has to publish the list itself.
+        let f = start(|_| {}, FAST, Hooks::default()).await;
+        let s = &f.session;
+        let rel = "pages/Fresh.md";
+        let view = s.page(rel).await.unwrap();
+        let id = view.rows[0].id;
+        let before = f.events.lock().unwrap().len();
+        assert!(s.set_draft(rel, view.r#gen, id, "fresh words"));
+        assert!(s.save_now(rel).await);
+        until("the saved page to be published", || {
+            f.events.lock().unwrap()[before..]
+                .iter()
+                .any(|e| matches!(e, Event::Pages))
+        })
+        .await;
+        f.pump.abort();
+    });
+}
+
+#[test]
+fn a_title_property_republishes_the_page_list() {
+    run(async {
+        let f = start(
+            |dir| {
+                std::fs::create_dir_all(dir.join("pages")).unwrap();
+                std::fs::write(dir.join("pages/x.md"), "- a\n").unwrap();
+            },
+            FAST,
+            Hooks::default(),
+        )
+        .await;
+        let s = &f.session;
+        let before = f.events.lock().unwrap().len();
+
+        // The page is indexed but not loaded, so this goes through the
+        // external-change path.
+        std::fs::write(f.file("pages/x.md"), "title:: Real Name\n- a\n").unwrap();
+        until("the new title to be indexed", || {
+            s.pages().iter().any(|p| p.title == "Real Name")
+        })
+        .await;
+        assert!(
+            f.events.lock().unwrap()[before..]
+                .iter()
+                .any(|e| matches!(e, Event::Pages)),
+            "a title change must republish the page list"
+        );
+        f.pump.abort();
+    });
+}
+
+#[test]
+fn a_duplicate_page_key_reaches_the_user() {
+    run(async {
+        let f = start(
+            |dir| {
+                std::fs::create_dir_all(dir.join("pages")).unwrap();
+                std::fs::write(dir.join("pages/Foo.md"), "- one\n").unwrap();
+                std::fs::write(dir.join("pages/foo.md"), "- two\n").unwrap();
+            },
+            FAST,
+            Hooks::default(),
+        )
+        .await;
+        until_event(
+            &f.events,
+            "the duplicate page key warning",
+            |e| matches!(e, Event::Notice(n) if n.message.contains("被多个文件使用")),
+        )
+        .await;
         f.pump.abort();
     });
 }

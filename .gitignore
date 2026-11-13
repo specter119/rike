@@ -4,3 +4,7 @@ target/
 .nsh/
 node_modules/
 /ui/dist/
+
+# Tool state and test-run artifacts.
+.ryugi/
+/fixtures/**/.rike/

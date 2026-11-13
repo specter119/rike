@@ -79,7 +79,7 @@ test("quit saves a draft without waiting for the debounce", async () => {
   const app = await start();
   await editFirst(app);
   await app.type("id:block-input", "last words");
-  await app.press("id:quit");
+  await app.press("id:window-close");
   await app.wait(380);
   expect(file(TODAY)).toBe("- last words\n");
   expect(app.count("id:block-input")).toBe(0);
@@ -87,7 +87,7 @@ test("quit saves a draft without waiting for the debounce", async () => {
 
 test("quit leaves an untouched journal unwritten", async () => {
   const app = await start();
-  await app.waitFor("text:Nov 1st, 2026");
+  await app.waitFor("id:journal-card");
   await app.keyboard.press("ctrl+w");
   await app.wait(500);
   expect(file(TODAY)).toBeNull();

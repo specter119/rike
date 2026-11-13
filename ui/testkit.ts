@@ -9,7 +9,9 @@ export const TODAY = "journals/2026_11_01.md";
 export async function start(opts: { seed?: "basic"; files?: Files; view?: { kind: "journals" | "page"; rel?: string } } = {}): Promise<App> {
   const files = Object.entries(opts.files ?? {}).map(([path, text]) => ({ path, text }));
   Rike.devReset(opts.seed ?? null, files, opts.view ?? null);
-  return open("./App.tsx");
+  // A desktop window: the sidebar alone is 248 wide, so a phone-sized engine
+  // would test a layout the app never runs in.
+  return open("./App.tsx", { width: 1280, height: 800, platform: "linux" });
 }
 
 /** Polls `read` until it equals `want` (the vault saves on a short delay). */
@@ -29,5 +31,7 @@ export const file = (rel: string): string | null => Rike.devRead(rel) ?? null;
 /** Starts the app with no vault open (the welcome page). */
 export async function startWelcome(opts: { recent?: string[]; notice?: string } = {}): Promise<App> {
   Rike.devWelcome(opts.recent ?? [], opts.notice ?? null);
-  return open("./App.tsx");
+  // A desktop window: the sidebar alone is 248 wide, so a phone-sized engine
+  // would test a layout the app never runs in.
+  return open("./App.tsx", { width: 1280, height: 800, platform: "linux" });
 }

@@ -1,9 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rike_core::BlockId;
 use rike_core::inline::{InlineKind, tokenize};
 use rike_core::names::PageKey;
+use uuid::Uuid;
 
+use crate::fts::FullText;
 use crate::{
     BacklinkGroup, BacklinkItem, BlockHit, BlockInfo, Index, IndexWarning, PageDelta, PageEntry,
     PageSource, SearchHit, resolve_title,
@@ -25,13 +27,15 @@ struct PageData {
 }
 
 /// In-memory [`Index`]. Backlinks use an inverted map so that updating one
-/// page only touches that page's entries.
+/// page only touches that page's entries; full-text search rides next to it
+/// in a tantivy index kept in lockstep.
 #[derive(Default)]
 pub struct MemIndex {
     pages: BTreeMap<String, PageData>,
     by_key: HashMap<PageKey, BTreeSet<String>>,
     refs_to: HashMap<PageKey, BTreeSet<(String, usize)>>,
     block_ids: HashMap<BlockId, BTreeSet<(String, usize)>>,
+    fts: FullText,
 }
 
 impl MemIndex {
@@ -53,6 +57,66 @@ impl MemIndex {
                 .then_with(|| a.entry.rel_path.cmp(&b.entry.rel_path))
         });
         pages
+    }
+
+    /// Case-insensitive substring scan; the exact-match half of `search`.
+    /// Titles first, then block text, each in `ordered()` order.
+    fn search_substring(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        let mut hits = Vec::new();
+        for page in self.ordered() {
+            if page.title_lower.contains(query) {
+                hits.push(SearchHit::Page(page.entry.clone()));
+                if hits.len() >= limit {
+                    return hits;
+                }
+            }
+        }
+        for page in self.ordered() {
+            for block in &page.blocks {
+                if block.lower.contains(query) {
+                    hits.push(SearchHit::Block {
+                        page: page.entry.clone(),
+                        block: block.id,
+                        text: block.text.clone(),
+                    });
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// jieba token search over the tantivy index; the relevance-ranked half
+    /// of `search`. Titles come first, then block text.
+    fn search_tokens(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        let mut hits = Vec::new();
+        for hit in self.fts.search_titles(query, limit) {
+            if let Some(page) = self.pages.get(&hit.rel) {
+                hits.push(SearchHit::Page(page.entry.clone()));
+            }
+            if hits.len() >= limit {
+                return hits;
+            }
+        }
+        for hit in self.fts.search_texts(query, limit - hits.len()) {
+            let Some(page) = self.pages.get(&hit.rel) else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(hit.block_id.as_deref().unwrap_or_default()) else {
+                continue;
+            };
+            hits.push(SearchHit::Block {
+                page: page.entry.clone(),
+                block: BlockId(id),
+                text: hit.text,
+            });
+            if hits.len() >= limit {
+                return hits;
+            }
+        }
+        hits
     }
 }
 
@@ -99,7 +163,28 @@ fn scan_text(keys: &mut BTreeSet<PageKey>, text: &str) {
     }
 }
 
+/// Identity of a hit, for deduping the two search mechanisms against each
+/// other.
+fn hit_key(hit: &SearchHit) -> (String, Option<BlockId>) {
+    match hit {
+        SearchHit::Page(page) => (page.rel_path.clone(), None),
+        SearchHit::Block { page, block, .. } => (page.rel_path.clone(), Some(*block)),
+    }
+}
+
 impl Index for MemIndex {
+    fn begin_batch(&mut self) {
+        self.fts.begin_batch();
+    }
+
+    fn commit(&mut self) {
+        self.fts.commit_pending();
+    }
+
+    fn end_batch(&mut self) {
+        self.fts.end_batch();
+    }
+
     fn upsert_page(&mut self, source: PageSource<'_>) -> PageDelta {
         let old_key = self
             .pages
@@ -147,6 +232,15 @@ impl Index for MemIndex {
             delta.backlink_keys.insert(key.clone());
         }
 
+        self.fts.upsert_page(
+            source.rel_path,
+            &title,
+            &blocks
+                .iter()
+                .map(|b| (b.id.0.to_string(), b.text.as_str()))
+                .collect::<Vec<_>>(),
+        );
+
         self.by_key
             .entry(key.clone())
             .or_default()
@@ -172,6 +266,7 @@ impl Index for MemIndex {
         let Some(old) = self.pages.remove(rel_path) else {
             return PageDelta::default();
         };
+        self.fts.remove_page(rel_path);
         if let Some(paths) = self.by_key.get_mut(&old.entry.key) {
             paths.remove(rel_path);
             if paths.is_empty() {
@@ -279,35 +374,45 @@ impl Index for MemIndex {
     }
 
     fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
-        let query = query.trim().to_lowercase();
+        let query = query.trim();
         if query.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let ordered = self.ordered();
-        let mut hits = Vec::new();
-        for page in &ordered {
-            if page.title_lower.contains(&query) {
-                hits.push(SearchHit::Page(page.entry.clone()));
-                if hits.len() >= limit {
-                    return hits;
-                }
-            }
-        }
-        for page in &ordered {
-            for block in &page.blocks {
-                if block.lower.contains(&query) {
-                    hits.push(SearchHit::Block {
-                        page: page.entry.clone(),
-                        block: block.id,
-                        text: block.text.clone(),
-                    });
+        // Both mechanisms, unioned and deduped, then ranked by precision:
+        // 0 — the page that IS the query (a jump target),
+        // 1 — every other verbatim match (the substring scan is exhaustive,
+        //      so it finds them all),
+        // 2 — jieba token matches that merely share the query's tokens
+        //     (吾 and 身 in different places for the query 吾身).
+        // The sort is stable, so within a tier the scan order and the BM25
+        // order survive.
+        let lower = query.to_lowercase();
+        let mut hits: Vec<(u8, SearchHit)> = self
+            .search_substring(&lower, limit)
+            .into_iter()
+            .map(|hit| {
+                let rank = match &hit {
+                    SearchHit::Page(page) if page.title.to_lowercase() == lower => 0,
+                    _ => 1,
+                };
+                (rank, hit)
+            })
+            .collect();
+        let mut seen: HashSet<(String, Option<BlockId>)> =
+            hits.iter().map(|(_, hit)| hit_key(hit)).collect();
+        if hits.len() < limit {
+            for hit in self.search_tokens(query, limit) {
+                if seen.insert(hit_key(&hit)) {
+                    hits.push((2, hit));
                     if hits.len() >= limit {
-                        return hits;
+                        break;
                     }
                 }
             }
         }
-        hits
+        hits.sort_by_key(|(rank, _)| *rank);
+        hits.truncate(limit);
+        hits.into_iter().map(|(_, hit)| hit).collect()
     }
 
     fn search_blocks(&self, query: &str, limit: usize) -> Vec<BlockHit> {
@@ -528,6 +633,63 @@ mod tests {
         assert!(matches!(&hits[1], SearchHit::Block { text, .. } if text.contains("RUST")));
         assert_eq!(index.search("rust", 1).len(), 1);
         assert!(index.search("  ", 10).is_empty());
+    }
+
+    #[test]
+    fn search_ranks_precise_hits_first() {
+        let mut index = MemIndex::new();
+        // Fuzzy: shares the query's tokens but not the query itself.
+        put(&mut index, "pages/Z.md", "- 吾 与 身\n");
+        // Verbatim: contains the query as written.
+        put(&mut index, "pages/A.md", "- 三省吾身\n");
+        // Jump target: the page IS the query.
+        put(&mut index, "pages/吾身.md", "- nothing\n");
+        let hits = index.search("吾身", 10);
+        assert_eq!(hits.len(), 3);
+        assert!(matches!(&hits[0], SearchHit::Page(p) if p.title == "吾身"));
+        assert!(matches!(&hits[1], SearchHit::Block { text, .. } if text.contains("三省")));
+        assert!(matches!(&hits[2], SearchHit::Block { text, .. } if text.contains("与")));
+        // The same hit found by both mechanisms is not listed twice.
+        assert_eq!(index.search("与", 10).len(), 1);
+    }
+
+    #[test]
+    fn search_falls_back_to_substring_inside_words() {
+        let mut index = MemIndex::new();
+        put(&mut index, "pages/笔记.md", "- 三省吾身\n");
+        // jieba keeps 三省吾身 as one dictionary word, so 吾身 is not a
+        // token — the substring fallback still finds it.
+        assert_eq!(index.search("吾身", 10).len(), 1);
+        // Half-typed English is not a token either, but still matches.
+        put(&mut index, "pages/B.md", "- I like RUST a lot\n");
+        assert!(!index.search("rus", 10).is_empty());
+    }
+
+    #[test]
+    fn search_tokens_match_compounds_and_conjoin() {
+        let mut index = MemIndex::new();
+        put(&mut index, "pages/笔记.md", "- 中文全文检索需要分词器\n");
+        // Search-mode indexing exposes the parts of compound words.
+        assert!(!index.search("全文", 10).is_empty());
+        assert!(!index.search("检索", 10).is_empty());
+        // Every token of a multi-token query must appear.
+        assert!(!index.search("中文 分词", 10).is_empty());
+        assert!(index.search("中文 不存在的词", 10).is_empty());
+        // Punctuation cannot crash anything; it just matches nothing.
+        assert!(index.search("((：:??", 10).is_empty());
+    }
+
+    #[test]
+    fn search_follows_incremental_updates() {
+        let mut index = MemIndex::new();
+        put(&mut index, "pages/A.md", "- 旧文本 old text\n");
+        assert!(!index.search("旧文本", 10).is_empty());
+        put(&mut index, "pages/A.md", "- 新文本 new text\n");
+        assert!(index.search("旧文本", 10).is_empty());
+        assert!(!index.search("新文本", 10).is_empty());
+        index.remove_page("pages/A.md");
+        assert!(index.search("新文本", 10).is_empty());
+        assert!(index.search("new", 10).is_empty());
     }
 
     #[test]

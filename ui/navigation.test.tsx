@@ -5,7 +5,7 @@ test("every journal day is its own card and opens as a page", async () => {
   const app = await start({ seed: "basic" });
   await app.waitFor("text:Meeting notes", { timeout: 20000 });
   await app.waitUntil(() => app.count("id:journal-card") >= 2);
-  expect(app.count("id:doc-path")).toBeGreaterThanOrEqual(2);
+  expect(app.count("id:doc-title")).toBeGreaterThanOrEqual(2);
   await app.press("id:doc-title >> nth=1");
   await app.waitUntil(() => app.count("id:journal-card") === 0);
   await app.waitFor("text:Meeting notes");
@@ -50,5 +50,5 @@ test("a page lists backlinks from a journal", async () => {
   await app.waitFor("id:nav-page >> text:Inbox", { timeout: 10000 });
   await app.press("id:nav-page >> text:Inbox");
   await app.waitFor("text:1 个页面链接到这里");
-  await app.waitFor("text:Oct 30th, 2026");
+  await app.waitFor("text:10月30日 周五");
 });

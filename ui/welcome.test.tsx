@@ -74,7 +74,7 @@ test("the folder dialog can be cancelled without breaking the page", async () =>
 
 test("quit on the welcome page does not need a vault", async () => {
   const app = await startWelcome();
-  await app.press("id:quit");
+  await app.press("id:window-close");
   await app.wait(300);
   expect(app.shows("id:leave-notice")).toBe(false);
 });
