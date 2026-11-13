@@ -10,7 +10,9 @@ description: >-
 disable-model-invocation: true
 metadata:
   stance-axis: capability-vs-cost
-  opposes: rike-write-safety-stance
+  opposes:
+    - rike-write-safety-stance
+    - rike-scope-discipline-stance
 ---
 
 # Rike capability stance

@@ -29,7 +29,7 @@ impl VaultConfig {
         let mut out = Vec::new();
         if self.file_name_format != FileNameFormat::TripleLowbar {
             out.push(
-                "`:file/name-format` is not `:triple-lowbar`; namespaced page file names may not map to page titles correctly"
+                "`:file/name-format` is not `:triple-lowbar`; rike only supports the `:triple-lowbar` format, so namespaced page file names may not map to page titles correctly"
                     .to_owned(),
             );
         }

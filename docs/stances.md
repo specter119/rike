@@ -26,9 +26,10 @@
 | S1 vs S2 | 磁盘上由 rike 拥有的派生字节 | 索引不落盘，每次启动重建 | 重建让打开库要等全量解析 | 把推导结果存下来，下次直接读 | 存下来的东西会过期、会损坏、需要版本号 | `git show 8da1774:crates/rike-native/src/session.rs`（`start()` 里 `self.scan().await`，先扫完再挂界面）；`AGENTS.md#里程碑边界`（"所有后端都只是可重建的派生缓存"） |
 | S2 vs S3 | 索引未就绪期间页面列表的权威 | 用 catalog 先画，不等索引 | catalog 是页面列表的第二个来源 | 页面列表只由索引产生，UI 只投影它 | 只由索引产生就必须等索引 | `crates/rike-native/src/session.rs#pages`（`index.pages()` 与 `catalog` 求并集）；`#journals`（日记流改读 `catalog`） |
 | S4 vs S5 | rike 接受并重写的 Logseq 构造范围 | 认不出就只读、就拒绝、就告警不合并 | 只读和拒绝让库用不下去 | 支持重命名、查询、属性类型，把库完整接管 | 重命名和查询要批量重写引用，一次写错就是全库损坏 | `AGENTS.md#数据格式不变量` 第 3 条（自检失败 → 只读）、第 5 条（页面键冲突只告警不合并）；`AGENTS.md#里程碑边界`（M1 不做页面重命名） |
-| S5 vs S6 | 下一次改动的地盘 | 补 M2 功能，让 rike 能日常用 | 每补一个功能就多一份状态和迁移 | 只做能删代码回退的改动 | 只做可逆改动就永远补不上功能 | `AGENTS.md#里程碑边界`（M1 不做 15 项、M3 推迟同步）；`AGENTS.md#架构与 crate 边界`（不新增 crate） |
+| S5 vs S6 | 下一次改动的地盘 | 补 M2 功能，让 rike 能日常用 | 每补一个功能就多一份状态和迁移 | 只做能删代码回退的改动 | 只做可逆改动就永远补不上功能 | `AGENTS.md#里程碑边界`（M1 不做 15 项、M3 推迟同步）；`AGENTS.md#架构与 crate 边界`（不新增 crate）；`docs/reviews/2026-11-13-stance-pass.md#32`（Rescan 是否重解析全库） |
+| S2 vs S6 | 引擎线程上的派生工作预算 | 扫描期搜索也要可用，派生不完整必须可见 | 每页一次进度/列表事件把界面拖成 O(页数²) | 派生工作合并、去抖、有退出路径 | 合并与去抖让“不完整”多等一个窗口 | `crates/rike-native/src/session.rs#index_from_disk`（`stale` 时逐页 `emit(Event::Pages)`）与 `#refresh_catalog`（300 ms 去抖）并存；`docs/reviews/2026-11-13-stance-pass.md#23` |
 
-四对都至少有一处已记录的决策，不是假设。
+五对都至少有一处已记录的决策，不是假设。
 
 ## 3. Unopposed stakes
 
@@ -48,15 +49,23 @@
 | Stance | Objective | In pairs |
 | --- | --- | --- |
 | `rike-derived-purity-stance` | 派生状态可丢弃，Markdown 是唯一权威 | S1 vs S2 |
-| `rike-instant-open-stance` | 窗口出现即可读，与库大小无关 | S1 vs S2；S2 vs S3 |
+| `rike-instant-open-stance` | 窗口出现即可读，与库大小无关 | S1 vs S2；S2 vs S3；S2 vs S6 |
 | `rike-single-owner-stance` | 一份数据一个权威，副本只作废不回写 | S2 vs S3 |
 | `rike-write-safety-stance` | 不丢不坏用户字节，拿不准就拒绝 | S4 vs S5 |
 | `rike-capability-stance` | 能当日常主力用，功能缺口就是 bug | S4 vs S5；S5 vs S6 |
-| `rike-scope-discipline-stance` | 每次改动可逆、地盘不扩大 | S5 vs S6 |
+| `rike-scope-discipline-stance` | 每次改动可逆、地盘不扩大 | S5 vs S6；S2 vs S6 |
 
 ## 6. Deviations
 
 - **S1 与 S6 在同向检查上部分重合**：对"把索引落盘"这件事两者都会反对（S1 说它成为新权威，S6 说它扩大地盘）。保留为两个 stance 的理由是它们在别处分开：S1 不管新增一个纯内存 memo（S6 会问成本），S6 不管新增一个没有派生状态的依赖（S1 无话可说）。若以后某个 pass 发现两者对同一改动给出同一条 finding，应合并。
-- **S5（capability）同时对立 S4 与 S6**，`opposes` 元数据只能写一个，取 S4（写安全）为主，S6 的对立在正文与账本里体现。
-- **“先打开后索引”这一轮改动同时踩到 S2 vs S3 和 S2 vs S6**（后台索引引入了排队状态机、进度事件、catalog）。地图只把 S2 vs S3 记为正式对；S2 vs S6 在 2026-11-13 的 pass 里被两个 reviewer 独立指出（`Index` trait 在只有一个实现时新增三个方法、空库时 `begin_batch` 没有对应的 `end_batch`），因此升为**已观察到的候选对**。暂不写成第 5 行，因为地图的正式对上限是 4；若下一次 pass 再次出现，应提升为正式行并考虑合并 S1 与 S6。
+- **S5（capability）同时对立 S4 与 S6**：`metadata.opposes` 写两者（列表），
+  `rike-scope-discipline-stance` 与 `rike-write-safety-stance` 各自回指它，元数据
+  与账本的五对对立一一对应。
+- **S2 vs S6 已提升为正式第 5 行**：2026-11-13 的 pass 里 `instant-open` 与
+  `scope-discipline` 从两个角度独立命中同一个 surface（扫描期逐页 `Event::Pages`
+  与 300 ms 去抖并存），符合“下一次 pass 再次出现就提升”的条件。`stance-design`
+  的“2–4 对”是指导不是上限；六条 stance 里没有一条只靠一对维系。
+- **S1 vs S6 仍是候选，不提升**：两者对 `.rike/pending/` 同向反对，但理由不同
+  （前者说它是伪装成缓存的权威，后者说它新增了撤不掉的落盘格式），不构成“同一条
+  finding”的合并证据。
 - **里程碑边界本身没有独立 stance**：M1 不做清单被 S4（拒绝重命名）和 S6（拒绝扩地盘）分别引用，不单独设 stance，避免与两者重复。

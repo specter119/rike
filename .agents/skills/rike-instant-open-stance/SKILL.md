@@ -11,7 +11,10 @@ description: >-
 disable-model-invocation: true
 metadata:
   stance-axis: latency-vs-completeness
-  opposes: rike-derived-purity-stance
+  opposes:
+    - rike-derived-purity-stance
+    - rike-single-owner-stance
+    - rike-scope-discipline-stance
 ---
 
 # Rike instant-open stance

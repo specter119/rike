@@ -37,9 +37,10 @@ crates/rike-app     宿主二进制 rike：命令行、日志、tokio runtime、
 ui/                 TSX 界面（NSH）。`nsh.json` 的 "rust" 指向 crates/rike-native。
 spikes/typst-math      `rike_native::math` 的命令行（`one`、`scan <dir>`）和公式提取器。不在 default-members。
 spikes/tsx-pump        常驻 pump 任务的 TSX 实验（独立工程，不在 workspace）。
-scripts/               build-release.sh、dev.sh、ui-test.sh；wayland-ime-smoke.sh（输入法复现）和它用的 gtk4_textview.py 对照程序。
+scripts/               build-release.sh、dev.sh、ui-test.sh；sync-logseq-docs.sh（刷新 Logseq 文档快照）；wayland-ime-smoke.sh（输入法复现）和它用的 gtk4_textview.py 对照程序。
 fixtures/vaults/       测试笔记库。
 docs/spikes/           探针与实验结论（tsx.md 是迁移到 TSX 的结论）。
+docs/reference/        格式参考：logseq-properties.md（属性兼容面与成本）、logseq/（Logseq 官方文档快照，由 scripts/sync-logseq-docs.sh 刷新；改 Markdown 解析/渲染前先跑 `--check`，有漂移就先刷新再对照）。
 ```
 
 - 依赖方向：`app` → `native` → `index`、`vault` → `core`。`core` 不能依赖 NSH、OpenDAL、tokio。`session`、`state`、`startup` 不依赖 NSH（只有 `api.rs` 依赖）。
@@ -116,15 +117,15 @@ crates/rike-app/src/main.rs        解析命令行，开 tokio runtime，决定�
 这些规则不能破坏。
 
 1. **磁盘格式**：`journals/yyyy_MM_dd.md`、`pages/<名称>.md`。子块用 tab 加 `- `，续行缩进为父缩进加两个空格。读取兼容空格缩进，写出统一用 tab。
-1. **属性**：第一个 bullet 之前的 `key:: value` 是页面属性；块首行之后紧跟的 `key:: value` 是块属性。key 小写，`_` 换成 `-`。
+1. **属性**：第一个 bullet 之前的 `key:: value` 是页面属性；块首行之后紧跟的 `key:: value` 是块属性。key 小写，`_` 换成 `-`。语法、位置、语义键、兼容缺口与成本见 `docs/reference/logseq-properties.md`。
 1. **无损兜底**：
    - 不认识的内容（YAML front matter、bullet 之前非属性的段落、没有 bullet 的 Markdown、代码围栏内部）一律原样保留为 raw 段。
    - 加载时自检：`serialize(parse(x))` 除了缩进空白和行尾，必须保留所有字符。不通过则页面只读并提示。
    - 规范格式文件往返必须逐字节一致。
 1. **块 ID**：每个块内存里都有 UUID。只有被引用时才写 `id::`。出现重复 `id::` 时取第一个并告警。
-1. **页面键**：页面名 NFC 规范化后转小写。`title::` 优先于文件名。多个文件映射到同一个页面键时告警，不合并。
+1. **页面键**：页面名 NFC 规范化后转小写。`title::` 优先于文件名（Logseq 官方文档：`title` 是内建页面属性，“overrides the title of a page to be different from the file name”）。多个文件映射到同一个页面键时告警，不合并。
 1. **文件名编码**：`/` 写成 `___`；其他保留字符做百分号编码。
-1. **每日页面（界面暂称 Journals）**：文件名日期和页面标题双向映射；从 `logseq/config.edn` 只提取 `:journal/page-title-format`（默认 `MMM do, yyyy`）、`:journal/file-name-format`（默认 `yyyy_MM_dd`）、`:file/name-format`，不引入完整 EDN 解析器。`:file/name-format` 不是 `:triple-lowbar` 时告警。空日志不落盘，第一次输入才创建文件。
+1. **每日页面（界面暂称 Journals）**：文件名日期和页面标题双向映射；从 `logseq/config.edn` 只提取 `:journal/page-title-format`（默认 `MMM do, yyyy`）、`:journal/file-name-format`（默认 `yyyy_MM_dd`）、`:file/name-format`，不引入完整 EDN 解析器。**只支持 `:triple-lowbar` 文件名格式**（rike 的 `___` + 百分号编码就是它）；`:file/name-format` 是 `:legacy` 时告警，因为那些库的页面名依赖 `title::` 才能还原。空日志不落盘，第一次输入才创建文件。
 1. **写入范围**：只重写被编辑的页面。忽略 `logseq/`、`.git/`、`.rike/` 和非 `.md` 文件。
 1. **只读页**：自检失败的页面，所有写入（包括写 `id::` 和撤销写回）都必须被 vault actor 拒绝。
 1. **偏移量**：`core` 内部只用字节偏移。UTF-16 与字节偏移的换算只放在 `rike-native` 的 session 层（`utf16_to_byte`），并要有测试覆盖中文和 emoji。

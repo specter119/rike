@@ -11,7 +11,9 @@ description: >-
 disable-model-invocation: true
 metadata:
   stance-axis: blast-radius-vs-breadth
-  opposes: rike-capability-stance
+  opposes:
+    - rike-capability-stance
+    - rike-instant-open-stance
 ---
 
 # Rike scope discipline stance
